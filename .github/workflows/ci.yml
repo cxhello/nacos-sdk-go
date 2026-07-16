@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [master, v3.x-dev]
 
+# Ensure each matrix job really uses its declared Go version instead of
+# silently downloading a newer toolchain (GOTOOLCHAIN defaults to auto).
+env:
+  GOTOOLCHAIN: local
+
 jobs:
   lint:
     name: Lint

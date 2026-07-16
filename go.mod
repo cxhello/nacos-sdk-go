@@ -2,8 +2,6 @@ module github.com/nacos-group/nacos-sdk-go/v3
 
 go 1.22.0
 
-toolchain go1.24.2
-
 require (
 	github.com/alibabacloud-go/darabonba-openapi/v2 v2.0.10
 	github.com/alibabacloud-go/kms-20160120/v3 v3.2.3
