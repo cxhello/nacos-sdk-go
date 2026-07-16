@@ -81,6 +81,11 @@ jobs:
             fi
             sleep 3
           done
+      - name: Initialize Nacos admin user
+        run: |
+          # Nacos 3.x ships without a default admin user; initialize it first
+          curl -sf -X POST "http://localhost:8848/nacos/v3/auth/user/admin" -d 'password=nacos'
+          curl -sf -X POST "http://localhost:8848/nacos/v1/auth/login" -d 'username=nacos&password=nacos' > /dev/null
       - name: Run integration tests
         run: go test -v -race -count=1 -tags=integration ./... -run TestIntegration -timeout 120s
       - name: Show Nacos logs on failure
@@ -121,6 +126,11 @@ jobs:
             fi
             sleep 3
           done
+      - name: Initialize Nacos admin user
+        run: |
+          # Nacos 2.5.x ships without a default admin user; initialize it first
+          curl -sf -X POST "http://localhost:8848/nacos/v1/auth/users/admin" -d 'password=nacos'
+          curl -sf -X POST "http://localhost:8848/nacos/v1/auth/login" -d 'username=nacos&password=nacos' > /dev/null
       - name: Run integration tests
         run: go test -v -race -count=1 -tags=integration ./... -run TestIntegration -timeout 120s
       - name: Show Nacos logs on failure
