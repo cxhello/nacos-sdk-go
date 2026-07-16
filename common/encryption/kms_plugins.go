@@ -18,9 +18,10 @@ package encryption
 
 import (
 	"fmt"
+	"strings"
+
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	inner_encoding "github.com/nacos-group/nacos-sdk-go/v3/common/encoding"
-	"strings"
 )
 
 type kmsPlugin struct {
