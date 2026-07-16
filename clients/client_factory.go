@@ -19,12 +19,12 @@ package clients
 import (
 	"github.com/pkg/errors"
 
-	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client"
-
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/config_client"
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/nacos_client"
+	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
+	"github.com/nacos-group/nacos-sdk-go/v3/util"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
 )
 
@@ -93,6 +93,9 @@ func setConfig(param vo.NacosClientParam) (iClient nacos_client.INacosClient, er
 		err = client.SetClientConfig(*param.ClientConfig)
 		if err != nil {
 			return nil, err
+		}
+		if param.ClientConfig.ClientIP != "" {
+			util.SetClientIPFromConfig(param.ClientConfig.ClientIP)
 		}
 	}
 

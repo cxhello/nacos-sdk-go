@@ -221,7 +221,7 @@ func (c *GrpcClient) createNewConnection(serverInfo ServerInfo) (*grpc.ClientCon
 }
 
 func (c *GrpcClient) getEnvTLSConfig(config *constant.TLSConfig) {
-	logger.Infof("check tls config ", config)
+	logger.Infof("check tls config: %v", config)
 
 	if config.Appointed == true {
 		return

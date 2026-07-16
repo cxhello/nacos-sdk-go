@@ -56,17 +56,24 @@ func GetConfigFailOverEncryptedDataKeyFileName(cacheKey, cacheDir string) string
 }
 
 func WriteServicesToFile(service *model.Service, cacheKey, cacheDir string) {
+	WriteServicesToFileWithResult(service, cacheKey, cacheDir)
+}
+
+// WriteServicesToFileWithResult writes service info to disk and returns whether the write succeeds.
+func WriteServicesToFileWithResult(service *model.Service, cacheKey, cacheDir string) bool {
 	err := file.MkdirIfNecessary(cacheDir)
 	if err != nil {
 		logger.Errorf("mkdir cacheDir failed,cacheDir:%s,err:", cacheDir, err)
-		return
+		return false
 	}
 	bytes, _ := json.Marshal(service)
 	domFileName := GetFileName(cacheKey, cacheDir)
 	err = os.WriteFile(domFileName, bytes, 0666)
 	if err != nil {
 		logger.Errorf("failed to write name cache:%s ,value:%s ,err:%v", domFileName, string(bytes), err)
+		return false
 	}
+	return true
 }
 
 func ReadServicesFromFile(cacheDir string) map[string]model.Service {

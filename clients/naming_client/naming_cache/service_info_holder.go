@@ -38,6 +38,7 @@ type ServiceInfoHolder struct {
 	notLoadCacheAtStart  bool
 	subCallback          *SubscribeCallback
 	UpdateTimeMap        sync.Map
+	diskCacheRefresher   *serviceInfoDiskCacheRefresher
 }
 
 func NewServiceInfoHolder(namespace, cacheDir string, updateCacheWhenEmpty, notLoadCacheAtStart bool) *ServiceInfoHolder {
@@ -49,6 +50,7 @@ func NewServiceInfoHolder(namespace, cacheDir string, updateCacheWhenEmpty, notL
 		subCallback:          NewSubscribeCallback(),
 		UpdateTimeMap:        sync.Map{},
 		ServiceInfoMap:       sync.Map{},
+		diskCacheRefresher:   newServiceInfoDiskCacheRefresher(defaultDiskCacheFlushInterval, cache.WriteServicesToFileWithResult),
 	}
 
 	if !notLoadCacheAtStart {
@@ -94,7 +96,7 @@ func (s *ServiceInfoHolder) ProcessService(service *model.Service) {
 	s.ServiceInfoMap.Store(cacheKey, *service)
 	if !ok || checkInstanceChanged(oldDomain, *service) {
 		logger.Infof("service key:%s was updated to:%s", cacheKey, util.ToJsonString(service))
-		cache.WriteServicesToFile(service, cacheKey, s.cacheDir)
+		s.refreshDiskCache(service, cacheKey)
 		s.subCallback.ServiceChanged(cacheKey, service)
 	}
 	var count int
@@ -130,6 +132,43 @@ func (s *ServiceInfoHolder) StopUpdateIfContain(serviceName, clusters string) {
 
 func (s *ServiceInfoHolder) IsSubscribed(serviceName, clusters string) bool {
 	return s.subCallback.IsSubscribed(serviceName, clusters)
+}
+
+func (s *ServiceInfoHolder) Close() {
+	if s.diskCacheRefresher != nil {
+		s.diskCacheRefresher.close()
+	}
+}
+
+func (s *ServiceInfoHolder) refreshDiskCache(service *model.Service, cacheKey string) {
+	if s.diskCacheRefresher == nil {
+		return
+	}
+	s.diskCacheRefresher.publish(&serviceInfoDiskCacheRefreshEvent{
+		service:  cloneService(service),
+		cacheKey: cacheKey,
+		cacheDir: s.cacheDir,
+	})
+}
+
+func cloneService(service *model.Service) *model.Service {
+	if service == nil {
+		return nil
+	}
+	cloned := *service
+	if service.Hosts != nil {
+		cloned.Hosts = make([]model.Instance, len(service.Hosts))
+		for i, instance := range service.Hosts {
+			cloned.Hosts[i] = instance
+			if instance.Metadata != nil {
+				cloned.Hosts[i].Metadata = make(map[string]string, len(instance.Metadata))
+				for key, value := range instance.Metadata {
+					cloned.Hosts[i].Metadata[key] = value
+				}
+			}
+		}
+	}
+	return &cloned
 }
 
 func checkInstanceChanged(oldDomain interface{}, service model.Service) bool {
