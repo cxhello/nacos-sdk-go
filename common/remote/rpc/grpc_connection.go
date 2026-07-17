@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/codec"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
@@ -79,14 +80,23 @@ func (g *GrpcConnection) biStreamSend(payload *nacos_grpc_service.Payload) error
 	return g.biStreamClient.Send(payload)
 }
 
+var payloadCodec = codec.NewPayloadCodec()
+
 func convertRequest(r rpc_request.IRequest) *nacos_grpc_service.Payload {
-	Metadata := nacos_grpc_service.Metadata{
+	if pc, ok := r.(codec.ProtoConvertible); ok {
+		payload, err := payloadCodec.Encode(r.GetRequestType(), pc.ProtoMessage(), r.GetHeaders(), util.LocalIP())
+		if err == nil {
+			return payload
+		}
+		logger.Warnf("proto encode %s failed, falling back to legacy json: %v", r.GetRequestType(), err)
+	}
+	metadata := nacos_grpc_service.Metadata{
 		Type:     r.GetRequestType(),
 		Headers:  r.GetHeaders(),
 		ClientIp: util.LocalIP(),
 	}
 	return &nacos_grpc_service.Payload{
-		Metadata: &Metadata,
+		Metadata: &metadata,
 		Body:     &anypb.Any{Value: []byte(r.GetBody(r))},
 	}
 }
