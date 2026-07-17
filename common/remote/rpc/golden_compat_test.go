@@ -52,6 +52,8 @@ func goldenCompare(t *testing.T, req rpc_request.IRequest, legacyOnly, protoOnly
 		delete(legacy, k)
 	}
 	for _, k := range protoOnly {
+		_, ok := protoM[k]
+		assert.True(t, ok, "expected proto-only field %q missing from proto json", k)
 		delete(protoM, k)
 	}
 	assert.Equal(t, legacy, protoM, "wire body must be field-level equivalent")

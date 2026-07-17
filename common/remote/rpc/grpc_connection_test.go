@@ -44,5 +44,5 @@ func TestConvertRequestLegacyPath(t *testing.T) {
 	req := &rpc_request.ConfigQueryRequest{ConfigRequest: rpc_request.NewConfigRequest("g", "d", "t")}
 	p := convertRequest(req)
 	assert.Equal(t, req.GetRequestType(), p.GetMetadata().GetType())
-	assert.JSONEq(t, req.GetBody(req), string(p.GetBody().GetValue()), "legacy path must be byte-compatible with json.Marshal")
+	assert.Equal(t, req.GetBody(req), string(p.GetBody().GetValue()), "legacy path must be byte-compatible with json.Marshal")
 }

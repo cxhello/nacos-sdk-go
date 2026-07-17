@@ -83,6 +83,8 @@ func adaptBaseResponse(resultCode, errorCode int32, message, requestId string, b
 	}
 	var raw map[string]interface{}
 	if err := json.Unmarshal(body, &raw); err == nil {
+		// A non-boolean wire "success" (never produced by real servers) falls
+		// through to resultCode derivation; the legacy path would hard-error.
 		if s, ok := raw[rpc_response.ResponseSuccessField].(bool); ok {
 			resp.Success = s
 			return resp

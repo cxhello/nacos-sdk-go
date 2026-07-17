@@ -52,6 +52,10 @@ func TestIntegrationReconnect(t *testing.T) {
 	require.NoError(t, err, "publish before restart")
 	require.True(t, ok)
 
+	defer func() {
+		_, _ = client.DeleteConfig(vo.ConfigParam{DataId: dataId, Group: testGroup})
+	}()
+
 	out, err := exec.Command("docker", "restart", container).CombinedOutput()
 	require.NoError(t, err, "docker restart %s: %s", container, out)
 
@@ -60,7 +64,6 @@ func TestIntegrationReconnect(t *testing.T) {
 	deadline := time.Now().Add(180 * time.Second)
 	for time.Now().Before(deadline) {
 		if got, err := client.GetConfig(vo.ConfigParam{DataId: dataId, Group: testGroup}); err == nil && got == content {
-			_, _ = client.DeleteConfig(vo.ConfigParam{DataId: dataId, Group: testGroup})
 			return
 		}
 		time.Sleep(2 * time.Second)
