@@ -36,10 +36,10 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 
-	nacos_grpc_service "github.com/nacos-group/nacos-sdk-go/v3/api/grpc"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/nacos_server"
+	nacos_grpc_service "github.com/nacos-group/nacos-sdk-proto/go"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"

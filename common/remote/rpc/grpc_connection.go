@@ -22,10 +22,10 @@ import (
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
 
-	nacos_grpc_service "github.com/nacos-group/nacos-sdk-go/v3/api/grpc"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
+	nacos_grpc_service "github.com/nacos-group/nacos-sdk-proto/go"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/types/known/anypb"
 
