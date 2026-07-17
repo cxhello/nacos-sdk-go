@@ -62,6 +62,21 @@ func (g *GrpcConnection) request(request rpc_request.IRequest, timeoutMills int6
 		return nil, err
 	}
 
+	// Migrated types (see proto_dispatch.go) are decoded through PayloadCodec
+	// and fail fast on decode error instead of falling back to the legacy
+	// json path: silently swallowing a migrated-type decode error would mask
+	// a protocol mismatch rather than surface it. This availability
+	// tradeoff is intentional for the unary request path; the server-push
+	// path (Task 6) differs because dropping a single push must not tear
+	// down the connection.
+	if resp, migrated, err := decodeProtoResponse(responsePayload); migrated {
+		if err != nil {
+			return nil, err
+		}
+		logger.Debugf("%s grpc request nacos server success (proto path), request=%+v", g.getConnectionId(), p)
+		return resp, nil
+	}
+
 	responseFunc, ok := rpc_response.ClientResponseMapping[responsePayload.Metadata.GetType()]
 	if !ok {
 		return nil, errors.Errorf("request:%s,unsupported response type:%s", request.GetRequestType(),
