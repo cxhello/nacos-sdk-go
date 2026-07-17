@@ -23,6 +23,8 @@ import (
 	"github.com/nacos-group/nacos-sdk-proto/go/common"
 	"github.com/pkg/errors"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 )
 
@@ -32,7 +34,13 @@ import (
 // reports whether the type is migrated; unmigrated types must fall
 // through to ClientResponseMapping. The dispatch is intentionally NOT
 // keyed off the codec registry: the registry knows all 112 types while
-// only the types below are migrated in this PR.
+// only the types below are migrated in this PR. Unlike
+// decodeProtoServerRequest, a migrated type that fails to decode returns
+// the error instead of falling back to legacy JSON: the caller is a
+// synchronous unary RPC waiting on this exact response, so silently
+// degrading would surface as a confusing downstream failure rather than
+// the real decode error, and fail-fast lets the caller propagate a clear
+// cause.
 func decodeProtoResponse(payload *nacos_grpc_service.Payload) (rpc_response.IResponse, bool, error) {
 	switch payload.GetMetadata().GetType() {
 	case "HealthCheckResponse", "ServerCheckResponse", "ErrorResponse":
@@ -82,4 +90,38 @@ func adaptBaseResponse(resultCode, errorCode int32, message, requestId string, b
 	}
 	resp.Success = resp.ResultCode == int(rpc_response.ResponseSuccessCode)
 	return resp
+}
+
+// decodeProtoServerRequest decodes migrated server-push requests into the
+// legacy rpc_request structs. Unlike decodeProtoResponse it falls back to
+// the legacy JSON path on decode failure: dropping a push (ConnectReset /
+// ClientDetection) degrades connection health silently, so availability
+// wins over fail-fast here.
+func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.IRequest, bool) {
+	switch payload.GetMetadata().GetType() {
+	case "ConnectResetRequest", "ClientDetectionRequest":
+	default:
+		return nil, false
+	}
+	msg, err := payloadCodec.Decode(payload)
+	if err != nil {
+		logger.Warnf("proto decode server request %s failed, falling back to legacy json: %v",
+			payload.GetMetadata().GetType(), err)
+		return nil, false
+	}
+	switch m := msg.(type) {
+	case *common.ConnectResetRequest:
+		req := &rpc_request.ConnectResetRequest{
+			InternalRequest: rpc_request.NewInternalRequest(),
+			ServerIp:        m.ServerIp,
+			ServerPort:      m.ServerPort,
+		}
+		req.RequestId = m.RequestId
+		return req, true
+	case *common.ClientDetectionRequest:
+		req := &rpc_request.ClientDetectionRequest{InternalRequest: rpc_request.NewInternalRequest()}
+		req.RequestId = m.RequestId
+		return req, true
+	}
+	return nil, false
 }

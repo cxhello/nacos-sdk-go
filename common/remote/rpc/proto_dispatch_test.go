@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/types/known/anypb"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 )
 
@@ -68,4 +69,33 @@ func TestDecodeProtoResponseUnmigratedFallsThrough(t *testing.T) {
 	_, migrated, err := decodeProtoResponse(protoPayload("ConfigQueryResponse", `{"resultCode":200}`))
 	require.NoError(t, err)
 	assert.False(t, migrated, "config/naming types stay on the legacy path until PR4/PR5")
+}
+
+func TestDecodeProtoServerRequestConnectReset(t *testing.T) {
+	req, ok := decodeProtoServerRequest(protoPayload("ConnectResetRequest",
+		`{"requestId":"r-9","serverIp":"10.0.0.2","serverPort":"8848"}`))
+	require.True(t, ok)
+	reset, isReset := req.(*rpc_request.ConnectResetRequest)
+	require.True(t, isReset, "handler type assertions must keep working")
+	assert.Equal(t, "10.0.0.2", reset.ServerIp)
+	assert.Equal(t, "8848", reset.ServerPort)
+	assert.Equal(t, "r-9", reset.GetRequestId())
+}
+
+func TestDecodeProtoServerRequestClientDetection(t *testing.T) {
+	req, ok := decodeProtoServerRequest(protoPayload("ClientDetectionRequest", `{"requestId":"r-2"}`))
+	require.True(t, ok)
+	_, isDetection := req.(*rpc_request.ClientDetectionRequest)
+	assert.True(t, isDetection)
+	assert.Equal(t, "r-2", req.GetRequestId())
+}
+
+func TestDecodeProtoServerRequestUnmigratedFallsThrough(t *testing.T) {
+	_, ok := decodeProtoServerRequest(protoPayload("NotifySubscriberRequest", `{}`))
+	assert.False(t, ok, "naming push stays on the legacy path until PR4")
+}
+
+func TestDecodeProtoServerRequestBadJsonFallsBack(t *testing.T) {
+	_, ok := decodeProtoServerRequest(protoPayload("ConnectResetRequest", `{not-json`))
+	assert.False(t, ok, "decode failure falls back to the legacy path for resilience")
 }

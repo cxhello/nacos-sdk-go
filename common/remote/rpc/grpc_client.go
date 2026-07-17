@@ -376,12 +376,15 @@ func (c *GrpcClient) handleServerRequest(p *nacos_grpc_service.Payload, grpcConn
 
 	mapping := handlerMapping.(ServerRequestHandlerMapping)
 
-	serverRequest := mapping.serverRequest()
-	err := json.Unmarshal(p.GetBody().Value, serverRequest)
-	if err != nil {
-		logger.Errorf("%s Fail to json Unmarshal for request:%s, ackId->%s", grpcConn.getConnectionId(),
-			serverRequest.GetRequestType(), serverRequest.GetRequestId())
-		return
+	serverRequest, decoded := decodeProtoServerRequest(p)
+	if !decoded {
+		serverRequest = mapping.serverRequest()
+		err := json.Unmarshal(p.GetBody().Value, serverRequest)
+		if err != nil {
+			logger.Errorf("%s Fail to json Unmarshal for request:%s, ackId->%s", grpcConn.getConnectionId(),
+				serverRequest.GetRequestType(), serverRequest.GetRequestId())
+			return
+		}
 	}
 
 	serverRequest.PutAllHeaders(p.GetMetadata().Headers)
@@ -393,7 +396,7 @@ func (c *GrpcClient) handleServerRequest(p *nacos_grpc_service.Payload, grpcConn
 		return
 	}
 	response.SetRequestId(serverRequest.GetRequestId())
-	err = grpcConn.biStreamSend(convertResponse(response))
+	err := grpcConn.biStreamSend(convertResponse(response))
 	if err != nil && err != io.EOF {
 		logger.Warnf("%s Fail to send response:%s,ackId->%s", grpcConn.getConnectionId(),
 			response.GetResponseType(), serverRequest.GetRequestId())
