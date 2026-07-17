@@ -1,6 +1,7 @@
 package codec
 
 import (
+	"encoding/json"
 	"testing"
 
 	nacos_grpc_service "github.com/nacos-group/nacos-sdk-proto/go"
@@ -8,6 +9,7 @@ import (
 	"github.com/nacos-group/nacos-sdk-proto/go/config"
 	"github.com/nacos-group/nacos-sdk-proto/go/naming"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/anypb"
 )
@@ -274,4 +276,32 @@ func TestPayloadCodec_AllLockTypesRegistered(t *testing.T) {
 		assert.True(t, ok, "lock type %s should be registered", typeName)
 		assert.NotNil(t, factory(), "factory for %s should return non-nil", typeName)
 	}
+}
+
+func TestEncodeEmitsDefaultValues(t *testing.T) {
+	c := NewPayloadCodec()
+	payload, err := c.Encode("HealthCheckRequest", &common.HealthCheckRequest{}, nil, "1.2.3.4")
+	require.NoError(t, err)
+	var m map[string]interface{}
+	require.NoError(t, json.Unmarshal(payload.GetBody().GetValue(), &m))
+	// 零值字段必须显式输出（PoC 结论：省略零值会让服务端无法区分未设置与零值）
+	v, ok := m["requestId"]
+	assert.True(t, ok, "requestId must be emitted even when zero-valued")
+	assert.Equal(t, "", v)
+}
+
+func TestDecodeDiscardsUnknownFields(t *testing.T) {
+	c := NewPayloadCodec()
+	// 服务端 JSON 携带 proto 中不存在的派生字段 success（Java getter 序列化产物）
+	body := []byte(`{"resultCode":200,"connectionId":"c-1","success":true}`)
+	payload := &nacos_grpc_service.Payload{
+		Metadata: &nacos_grpc_service.Metadata{Type: "ServerCheckResponse"},
+		Body:     &anypb.Any{Value: body},
+	}
+	msg, err := c.Decode(payload)
+	require.NoError(t, err, "unknown fields from server must be tolerated")
+	resp, ok := msg.(*common.ServerCheckResponse)
+	require.True(t, ok)
+	assert.Equal(t, int32(200), resp.ResultCode)
+	assert.Equal(t, "c-1", resp.ConnectionId)
 }
