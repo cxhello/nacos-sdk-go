@@ -18,7 +18,7 @@ package security
 
 import (
 	"context"
-	"time"
+	"errors"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
@@ -111,13 +111,23 @@ type SecurityProxy struct {
 	Clients []AuthClient
 }
 
-func (sp *SecurityProxy) Login() {
+func (sp *SecurityProxy) Login() error {
+	var credentialErr error
 	for _, client := range sp.Clients {
 		_, err := client.Login()
-		if err != nil {
-			logger.Errorf("login in err:%v", err)
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, ErrLoginFailed) {
+			logger.Errorf("nacos auth login failed, please check username/password: %v", err)
+			if credentialErr == nil {
+				credentialErr = err
+			}
+		} else {
+			logger.Warnf("nacos auth login transient error, will retry: %v", err)
 		}
 	}
+	return credentialErr
 }
 
 func (sp *SecurityProxy) GetSecurityInfo(resource RequestResource) map[string]string {
@@ -140,19 +150,9 @@ func (sp *SecurityProxy) UpdateServerList(serverList []constant.ServerConfig) {
 }
 
 func (sp *SecurityProxy) AutoRefresh(ctx context.Context) {
-	go func() {
-		var timer = time.NewTimer(time.Second * time.Duration(5))
-		defer timer.Stop()
-		for {
-			select {
-			case <-timer.C:
-				sp.Login()
-				timer.Reset(time.Second * time.Duration(5))
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
+	for _, client := range sp.Clients {
+		client.AutoRefresh(ctx)
+	}
 }
 
 func NewSecurityProxy(clientCfg constant.ClientConfig, serverCfgs []constant.ServerConfig, agent http_agent.IHttpAgent) SecurityProxy {
