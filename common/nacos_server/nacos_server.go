@@ -18,6 +18,7 @@ package nacos_server
 
 import (
 	"context"
+	stderrors "errors"
 	"io"
 	"math/rand"
 	"net/http"
@@ -91,7 +92,11 @@ func NewNacosServerWithRamCredentialProvider(ctx context.Context, serverList []c
 		ns.initRefreshSrvIfNeed(ctx)
 	}
 
-	ns.securityLogin.Login()
+	if err := ns.securityLogin.Login(); err != nil {
+		if clientCfg.FailOnAuthError && stderrors.Is(err, security.ErrLoginFailed) {
+			return nil, err
+		}
+	}
 	ns.securityLogin.AutoRefresh(ctx)
 	return &ns, nil
 }
