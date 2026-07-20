@@ -13,7 +13,6 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
-	"github.com/pkg/errors"
 )
 
 type NacosAuthClient struct {
@@ -161,8 +160,7 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 	}
 
 	if resp.StatusCode != constant.RESPONSE_CODE_SUCCESS {
-		errMsg := string(bytes)
-		return false, errors.New(errMsg)
+		return false, classifyLoginStatus(resp.StatusCode, string(bytes))
 	}
 
 	var result map[string]interface{}

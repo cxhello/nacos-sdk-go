@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -284,6 +285,7 @@ func TestNacosAuthClient_LoginFailure(t *testing.T) {
 
 	success, err := client.Login()
 	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrLoginFailed), "401 must be classified as credential error")
 	assert.False(t, success)
 	assert.Empty(t, client.GetAccessToken())
 }
