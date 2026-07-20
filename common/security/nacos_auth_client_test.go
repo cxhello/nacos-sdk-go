@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -288,4 +289,63 @@ func TestNacosAuthClient_LoginFailure(t *testing.T) {
 	assert.True(t, errors.Is(err, ErrLoginFailed), "401 must be classified as credential error")
 	assert.False(t, success)
 	assert.Empty(t, client.GetAccessToken())
+}
+
+func TestNacosAuthClient_ConcurrentLoginAndUpdateServerList(t *testing.T) {
+	mockAgent := &MockHttpAgent{
+		PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: constant.RESPONSE_CODE_SUCCESS,
+				Body: NewMockResponseBody(map[string]interface{}{
+					constant.KEY_ACCESS_TOKEN: "concurrent-token",
+					constant.KEY_TOKEN_TTL:    float64(10),
+				}),
+			}, nil
+		},
+	}
+	client := NewNacosAuthClient(
+		constant.ClientConfig{Username: "u", Password: "p"},
+		[]constant.ServerConfig{{IpAddr: "localhost"}},
+		mockAgent,
+	)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				client.UpdateServerList([]constant.ServerConfig{{IpAddr: "127.0.0.1"}, {IpAddr: "localhost"}})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = client.Login()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = client.GetServerList()
+			}
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
 }

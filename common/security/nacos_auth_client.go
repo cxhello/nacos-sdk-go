@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -25,6 +26,7 @@ type NacosAuthClient struct {
 	agent              http_agent.IHttpAgent
 	clientCfg          constant.ClientConfig
 	serverCfgs         []constant.ServerConfig
+	mux                sync.Mutex
 }
 
 func NewNacosAuthClient(clientCfg constant.ClientConfig, serverCfgs []constant.ServerConfig, agent http_agent.IHttpAgent) *NacosAuthClient {
@@ -58,17 +60,21 @@ func (ac *NacosAuthClient) GetSecurityInfo(resource RequestResource) map[string]
 }
 
 func (ac *NacosAuthClient) AutoRefresh(ctx context.Context) {
-
 	// If the username is not set, the automatic refresh Token is not enabled
-
 	if ac.username == "" {
 		return
 	}
 
 	go func() {
+		ac.mux.Lock()
+		lastRefreshTime := ac.lastRefreshTime
+		tokenTtl := ac.tokenTtl
+		tokenRefreshWindow := ac.tokenRefreshWindow
+		ac.mux.Unlock()
+
 		var timer *time.Timer
-		if lastLoginSuccess := ac.lastRefreshTime > 0 && ac.tokenTtl > 0 && ac.tokenRefreshWindow > 0; lastLoginSuccess {
-			timer = time.NewTimer(time.Second * time.Duration(ac.tokenTtl-ac.tokenRefreshWindow))
+		if lastLoginSuccess := lastRefreshTime > 0 && tokenTtl > 0 && tokenRefreshWindow > 0; lastLoginSuccess {
+			timer = time.NewTimer(time.Second * time.Duration(tokenTtl-tokenRefreshWindow))
 		} else {
 			timer = time.NewTimer(time.Second * time.Duration(5))
 		}
@@ -81,8 +87,12 @@ func (ac *NacosAuthClient) AutoRefresh(ctx context.Context) {
 					logger.Errorf("login has error %+v", err)
 					timer.Reset(time.Second * time.Duration(5))
 				} else {
-					logger.Infof("login success, tokenTtl: %+v seconds, tokenRefreshWindow: %+v seconds", ac.tokenTtl, ac.tokenRefreshWindow)
-					timer.Reset(time.Second * time.Duration(ac.tokenTtl-ac.tokenRefreshWindow))
+					ac.mux.Lock()
+					ttl := ac.tokenTtl
+					window := ac.tokenRefreshWindow
+					ac.mux.Unlock()
+					logger.Infof("login success, tokenTtl: %+v seconds, tokenRefreshWindow: %+v seconds", ttl, window)
+					timer.Reset(time.Second * time.Duration(ttl-window))
 				}
 			case <-ctx.Done():
 				return
@@ -92,9 +102,14 @@ func (ac *NacosAuthClient) AutoRefresh(ctx context.Context) {
 }
 
 func (ac *NacosAuthClient) Login() (bool, error) {
+	ac.mux.Lock()
+	servers := make([]constant.ServerConfig, len(ac.serverCfgs))
+	copy(servers, ac.serverCfgs)
+	ac.mux.Unlock()
+
 	var throwable error = nil
-	for i := 0; i < len(ac.serverCfgs); i++ {
-		result, err := ac.login(ac.serverCfgs[i])
+	for i := 0; i < len(servers); i++ {
+		result, err := ac.login(servers[i])
 		throwable = err
 		if result {
 			return true, nil
@@ -104,36 +119,45 @@ func (ac *NacosAuthClient) Login() (bool, error) {
 }
 
 func (ac *NacosAuthClient) UpdateServerList(serverList []constant.ServerConfig) {
+	ac.mux.Lock()
 	ac.serverCfgs = serverList
+	ac.mux.Unlock()
 }
 
 func (ac *NacosAuthClient) GetServerList() []constant.ServerConfig {
+	ac.mux.Lock()
+	defer ac.mux.Unlock()
 	return ac.serverCfgs
 }
 
 func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
-	if ac.lastRefreshTime > 0 && ac.tokenTtl > 0 {
+	ac.mux.Lock()
+	lastRefreshTime := ac.lastRefreshTime
+	tokenTtl := ac.tokenTtl
+	tokenRefreshWindow := ac.tokenRefreshWindow
+	ac.mux.Unlock()
+
+	if lastRefreshTime > 0 && tokenTtl > 0 {
 		// We refresh 2 windows before expiration to ensure continuous availability
-		tokenRefreshTime := ac.lastRefreshTime + ac.tokenTtl - 2*ac.tokenRefreshWindow
+		tokenRefreshTime := lastRefreshTime + tokenTtl - 2*tokenRefreshWindow
 		if time.Now().Unix() < tokenRefreshTime {
 			return true, nil
 		}
 	}
 	if ac.username == "" {
+		ac.mux.Lock()
 		ac.lastRefreshTime = time.Now().Unix()
+		ac.mux.Unlock()
 		return true, nil
 	}
 
 	contextPath := server.ContextPath
-
 	if !strings.HasPrefix(contextPath, "/") {
 		contextPath = "/" + contextPath
 	}
-
 	if strings.HasSuffix(contextPath, "/") {
 		contextPath = contextPath[0 : len(contextPath)-1]
 	}
-
 	if server.Scheme == "" {
 		server.Scheme = "http"
 	}
@@ -147,7 +171,6 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 		"username": ac.username,
 		"password": ac.password,
 	})
-
 	if err != nil {
 		return false, err
 	}
@@ -164,20 +187,19 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 	}
 
 	var result map[string]interface{}
-
 	err = json.Unmarshal(bytes, &result)
-
 	if err != nil {
 		return false, err
 	}
 
 	if val, ok := result[constant.KEY_ACCESS_TOKEN]; ok {
 		ac.accessToken.Store(val)
+		ac.mux.Lock()
 		ac.lastRefreshTime = time.Now().Unix()
 		ac.tokenTtl = int64(result[constant.KEY_TOKEN_TTL].(float64))
 		ac.tokenRefreshWindow = ac.tokenTtl / 10
+		ac.mux.Unlock()
 	}
 
 	return true, nil
-
 }
