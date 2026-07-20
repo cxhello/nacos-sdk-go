@@ -194,9 +194,10 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 
 	if val, ok := result[constant.KEY_ACCESS_TOKEN]; ok {
 		ac.accessToken.Store(val)
+		ttlRaw, _ := result[constant.KEY_TOKEN_TTL].(float64)
 		ac.mux.Lock()
 		ac.lastRefreshTime = time.Now().Unix()
-		ac.tokenTtl = int64(result[constant.KEY_TOKEN_TTL].(float64))
+		ac.tokenTtl = int64(ttlRaw)
 		ac.tokenRefreshWindow = ac.tokenTtl / 10
 		ac.mux.Unlock()
 	}
