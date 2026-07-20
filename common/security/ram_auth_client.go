@@ -1,6 +1,8 @@
 package security
 
 import (
+	"context"
+
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 )
 
@@ -91,5 +93,12 @@ func (rac *RamAuthClient) GetSecurityInfo(resource RequestResource) map[string]s
 }
 
 func (rac *RamAuthClient) UpdateServerList(serverList []constant.ServerConfig) {
+	return
+}
+
+// AutoRefresh is a no-op: RAM/STS credentials are refreshed lazily by the
+// matched provider on each GetSecurityInfo call, so there is no background
+// token to renew here.
+func (rac *RamAuthClient) AutoRefresh(ctx context.Context) {
 	return
 }

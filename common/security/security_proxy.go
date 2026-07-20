@@ -102,6 +102,7 @@ func BuildNamingResource(namespace, group, serviceName string) RequestResource {
 
 type AuthClient interface {
 	Login() (bool, error)
+	AutoRefresh(ctx context.Context)
 	GetSecurityInfo(resource RequestResource) map[string]string
 	UpdateServerList(serverList []constant.ServerConfig)
 }
