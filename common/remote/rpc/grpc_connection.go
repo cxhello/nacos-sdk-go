@@ -21,11 +21,12 @@ import (
 	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/codec"
 
-	nacos_grpc_service "github.com/nacos-group/nacos-sdk-go/v3/api/grpc"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
+	nacos_grpc_service "github.com/nacos-group/nacos-sdk-proto/go"
 	"github.com/pkg/errors"
 	"google.golang.org/protobuf/types/known/anypb"
 
@@ -61,6 +62,21 @@ func (g *GrpcConnection) request(request rpc_request.IRequest, timeoutMills int6
 		return nil, err
 	}
 
+	// Migrated types (see proto_dispatch.go) are decoded through PayloadCodec
+	// and fail fast on decode error instead of falling back to the legacy
+	// json path: silently swallowing a migrated-type decode error would mask
+	// a protocol mismatch rather than surface it. This availability
+	// tradeoff is intentional for the unary request path; the server-push
+	// path (Task 6) differs because dropping a single push must not tear
+	// down the connection.
+	if resp, migrated, err := decodeProtoResponse(responsePayload); migrated {
+		if err != nil {
+			return nil, err
+		}
+		logger.Debugf("%s grpc request nacos server success (proto path), request=%+v", g.getConnectionId(), p)
+		return resp, nil
+	}
+
 	responseFunc, ok := rpc_response.ClientResponseMapping[responsePayload.Metadata.GetType()]
 	if !ok {
 		return nil, errors.Errorf("request:%s,unsupported response type:%s", request.GetRequestType(),
@@ -79,14 +95,23 @@ func (g *GrpcConnection) biStreamSend(payload *nacos_grpc_service.Payload) error
 	return g.biStreamClient.Send(payload)
 }
 
+var payloadCodec = codec.NewPayloadCodec()
+
 func convertRequest(r rpc_request.IRequest) *nacos_grpc_service.Payload {
-	Metadata := nacos_grpc_service.Metadata{
+	if pc, ok := r.(codec.ProtoConvertible); ok {
+		payload, err := payloadCodec.Encode(r.GetRequestType(), pc.ProtoMessage(), r.GetHeaders(), util.LocalIP())
+		if err == nil {
+			return payload
+		}
+		logger.Warnf("proto encode %s failed, falling back to legacy json: %v", r.GetRequestType(), err)
+	}
+	metadata := nacos_grpc_service.Metadata{
 		Type:     r.GetRequestType(),
 		Headers:  r.GetHeaders(),
 		ClientIp: util.LocalIP(),
 	}
 	return &nacos_grpc_service.Payload{
-		Metadata: &Metadata,
+		Metadata: &metadata,
 		Body:     &anypb.Any{Value: []byte(r.GetBody(r))},
 	}
 }
