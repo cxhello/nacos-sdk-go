@@ -24,16 +24,21 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestClassifyLoginStatus_Credential(t *testing.T) {
-	for _, code := range []int{http.StatusUnauthorized, http.StatusForbidden} {
-		err := classifyLoginStatus(code, "unknown user!")
+func TestClassifyLoginStatus_WrapsAllNon200(t *testing.T) {
+	// Real Nacos servers return an inconsistent mix of 401/403/500 for rejected
+	// credentials across versions (2.x: 403 for a wrong password, 500 for an
+	// unknown user; 3.x is the reverse), and a 5xx body carries no reliable
+	// credential hint. Any non-200 login response means no token was issued, so
+	// classifyLoginStatus wraps them all as ErrLoginFailed for FailOnAuthError
+	// to act on. Transport errors (server unreachable) never reach here.
+	for _, code := range []int{
+		http.StatusUnauthorized,
+		http.StatusForbidden,
+		http.StatusInternalServerError,
+		http.StatusBadRequest,
+	} {
+		err := classifyLoginStatus(code, "rejected")
 		assert.Error(t, err)
-		assert.True(t, errors.Is(err, ErrLoginFailed), "status %d should be credential error", code)
+		assert.True(t, errors.Is(err, ErrLoginFailed), "status %d should wrap ErrLoginFailed", code)
 	}
-}
-
-func TestClassifyLoginStatus_Transient(t *testing.T) {
-	err := classifyLoginStatus(http.StatusInternalServerError, "server busy")
-	assert.Error(t, err)
-	assert.False(t, errors.Is(err, ErrLoginFailed), "5xx should not be credential error")
 }

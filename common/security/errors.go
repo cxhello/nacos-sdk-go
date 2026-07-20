@@ -19,21 +19,23 @@ package security
 import (
 	"errors"
 	"fmt"
-	"net/http"
 )
 
-// ErrLoginFailed marks a credential-level auth failure (HTTP 401/403), as
-// opposed to a transient network or server error. NewNacosServer only aborts
-// client construction on this error when ClientConfig.FailOnAuthError is set;
-// transient errors are always retried by the auto-refresh loop.
+// ErrLoginFailed marks an auth login failure: the login endpoint returned a
+// non-200 response, so no access token was issued. NewNacosServer aborts client
+// construction on this error only when ClientConfig.FailOnAuthError is set.
+// Transport errors (server unreachable) are not wrapped in this and stay
+// transient, always retried by the auto-refresh loop.
 var ErrLoginFailed = errors.New("nacos auth login failed")
 
-// classifyLoginStatus wraps a non-200 login response. HTTP 401/403 indicate a
-// credential problem and wrap ErrLoginFailed; any other status is treated as a
-// transient failure that should be retried rather than surfaced to NewClient.
+// classifyLoginStatus wraps any non-200 login response as ErrLoginFailed. Real
+// Nacos servers return an inconsistent mix of 401/403/500 for rejected
+// credentials across versions (2.x returns 403 for a wrong password but 500 for
+// an unknown user; 3.x is the reverse), and a 5xx body carries no reliable
+// credential hint. Since any non-200 response means no token was issued, all are
+// surfaced as an auth failure so FailOnAuthError can act on them consistently.
+// Transport errors (server unreachable) never reach here — the caller keeps
+// those transient and retryable.
 func classifyLoginStatus(statusCode int, body string) error {
-	if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
-		return fmt.Errorf("%w: status=%d body=%s", ErrLoginFailed, statusCode, body)
-	}
-	return fmt.Errorf("nacos auth login unexpected response: status=%d body=%s", statusCode, body)
+	return fmt.Errorf("%w: status=%d body=%s", ErrLoginFailed, statusCode, body)
 }
