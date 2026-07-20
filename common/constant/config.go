@@ -62,6 +62,7 @@ type ClientConfig struct {
 	ClusterName          string                   // the address server  clusterName
 	AppConnLabels        map[string]string        // app conn labels
 	ClientIP             string                   // the custom client ip, if not set, will use local ip auto detected
+	FailOnAuthError      bool                     // if true, NewClient returns an error when the initial credential login fails (HTTP 401/403); default false keeps backward-compatible behavior
 }
 
 type ClientLogSamplingConfig struct {

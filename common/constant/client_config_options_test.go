@@ -93,3 +93,9 @@ func TestNewClientConfigWithOptions(t *testing.T) {
 	assert.Equal(t, config.AccessKey, "accessKey_1")
 	assert.Equal(t, config.SecretKey, "secretKey_1")
 }
+
+func TestWithFailOnAuthError(t *testing.T) {
+	config := ClientConfig{}
+	WithFailOnAuthError(true)(&config)
+	assert.True(t, config.FailOnAuthError)
+}
