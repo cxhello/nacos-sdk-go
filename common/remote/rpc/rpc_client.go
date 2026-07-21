@@ -616,7 +616,8 @@ func (r *RpcClient) Request(request rpc_request.IRequest, timeoutMills int64) (r
 		conn := r.GetCurrentConnection()
 		if conn == nil || !r.IsRunning() {
 			currentErr = waitReconnect(timeoutMills, &retryTimes, request,
-				errors.Errorf("client not connected, current status:%s", r.rpcClientStatus.getDesc()))
+				errors.Errorf("client not connected, current status:%s",
+					RpcClientStatus(atomic.LoadInt32((*int32)(&r.rpcClientStatus))).getDesc()))
 			continue
 		}
 		response, err := conn.request(request, timeoutMills, r)
