@@ -408,3 +408,35 @@ func TestNacosAuthClient_Login_ValidResponseStillSucceeds(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "valid-token", client.GetAccessToken())
 }
+
+func TestNacosAuthClient_RefreshDeadline_Deterministic(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	client.mux.Lock()
+	client.lastRefreshTime = 1_000_000
+	client.tokenTtl = 10
+	client.tokenRefreshWindow = 1
+	client.mux.Unlock()
+
+	deadline, ok := client.refreshDeadlineUnix()
+	assert.True(t, ok)
+	// lastRefreshTime + ttl - 2*window = 1000000 + 10 - 2 = 1000008
+	assert.Equal(t, int64(1_000_008), deadline, "deadline must be two windows before expiry")
+}
+
+func TestNacosAuthClient_RefreshDeadline_NotLoggedIn(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	_, ok := client.refreshDeadlineUnix()
+	assert.False(t, ok, "no deadline before a successful login")
+	assert.Equal(t, retryDelay, client.nextRefreshDelay(), "unauthenticated delay is the retry cadence")
+}
+
+func TestNacosAuthClient_NextRefreshDelay_ClampsPastDeadline(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	client.mux.Lock()
+	// deadline far in the past → raw delay is negative → must clamp to minRefreshDelay
+	client.lastRefreshTime = 1
+	client.tokenTtl = 10
+	client.tokenRefreshWindow = 1
+	client.mux.Unlock()
+	assert.Equal(t, minRefreshDelay, client.nextRefreshDelay(), "a passed deadline must not spin the timer")
+}

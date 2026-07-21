@@ -30,6 +30,44 @@ type NacosAuthClient struct {
 	mux                sync.Mutex
 }
 
+const (
+	// retryDelay is the cadence for retrying before the first successful login
+	// and for backing off after a failed refresh.
+	retryDelay = 5 * time.Second
+	// minRefreshDelay floors a scheduled refresh so a passed or near deadline
+	// cannot spin the timer into a tight login loop.
+	minRefreshDelay = 1 * time.Second
+)
+
+// refreshDeadlineUnix returns the unix second at which the token should be
+// refreshed — two windows before expiry — and whether a successful login has
+// established one yet. The guard in login() and the scheduler in AutoRefresh()
+// both derive from this single rule so they never diverge.
+func (ac *NacosAuthClient) refreshDeadlineUnix() (int64, bool) {
+	ac.mux.Lock()
+	defer ac.mux.Unlock()
+	if ac.lastRefreshTime <= 0 || ac.tokenTtl <= 0 {
+		return 0, false
+	}
+	return ac.lastRefreshTime + ac.tokenTtl - 2*ac.tokenRefreshWindow, true
+}
+
+// nextRefreshDelay returns how long to wait before the next refresh attempt,
+// derived from the refresh deadline and the current time. Before any successful
+// login it returns retryDelay; a passed or near deadline is clamped to
+// minRefreshDelay so the timer never tight-loops.
+func (ac *NacosAuthClient) nextRefreshDelay() time.Duration {
+	deadline, ok := ac.refreshDeadlineUnix()
+	if !ok {
+		return retryDelay
+	}
+	delay := time.Duration(deadline-time.Now().Unix()) * time.Second
+	if delay < minRefreshDelay {
+		delay = minRefreshDelay
+	}
+	return delay
+}
+
 func NewNacosAuthClient(clientCfg constant.ClientConfig, serverCfgs []constant.ServerConfig, agent http_agent.IHttpAgent) *NacosAuthClient {
 	client := &NacosAuthClient{
 		username:    clientCfg.Username,
@@ -67,33 +105,21 @@ func (ac *NacosAuthClient) AutoRefresh(ctx context.Context) {
 	}
 
 	go func() {
-		ac.mux.Lock()
-		lastRefreshTime := ac.lastRefreshTime
-		tokenTtl := ac.tokenTtl
-		tokenRefreshWindow := ac.tokenRefreshWindow
-		ac.mux.Unlock()
-
-		var timer *time.Timer
-		if lastLoginSuccess := lastRefreshTime > 0 && tokenTtl > 0 && tokenRefreshWindow > 0; lastLoginSuccess {
-			timer = time.NewTimer(time.Second * time.Duration(tokenTtl-tokenRefreshWindow))
-		} else {
-			timer = time.NewTimer(time.Second * time.Duration(5))
-		}
+		timer := time.NewTimer(ac.nextRefreshDelay())
 		defer timer.Stop()
 		for {
 			select {
 			case <-timer.C:
-				_, err := ac.Login()
-				if err != nil {
+				if _, err := ac.Login(); err != nil {
 					logger.Errorf("login has error %+v", err)
-					timer.Reset(time.Second * time.Duration(5))
+					timer.Reset(retryDelay)
 				} else {
 					ac.mux.Lock()
 					ttl := ac.tokenTtl
 					window := ac.tokenRefreshWindow
 					ac.mux.Unlock()
 					logger.Infof("login success, tokenTtl: %+v seconds, tokenRefreshWindow: %+v seconds", ttl, window)
-					timer.Reset(time.Second * time.Duration(ttl-window))
+					timer.Reset(ac.nextRefreshDelay())
 				}
 			case <-ctx.Done():
 				return
@@ -132,18 +158,10 @@ func (ac *NacosAuthClient) GetServerList() []constant.ServerConfig {
 }
 
 func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
-	ac.mux.Lock()
-	lastRefreshTime := ac.lastRefreshTime
-	tokenTtl := ac.tokenTtl
-	tokenRefreshWindow := ac.tokenRefreshWindow
-	ac.mux.Unlock()
-
-	if lastRefreshTime > 0 && tokenTtl > 0 {
-		// We refresh 2 windows before expiration to ensure continuous availability
-		tokenRefreshTime := lastRefreshTime + tokenTtl - 2*tokenRefreshWindow
-		if time.Now().Unix() < tokenRefreshTime {
-			return true, nil
-		}
+	// Skip the network round-trip while the token is still comfortably valid,
+	// using the same deadline rule the scheduler uses.
+	if deadline, ok := ac.refreshDeadlineUnix(); ok && time.Now().Unix() < deadline {
+		return true, nil
 	}
 	if ac.username == "" {
 		ac.mux.Lock()
