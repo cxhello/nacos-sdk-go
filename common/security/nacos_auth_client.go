@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strconv"
@@ -192,15 +193,21 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 		return false, err
 	}
 
-	if val, ok := result[constant.KEY_ACCESS_TOKEN]; ok {
-		ac.accessToken.Store(val)
-		ttlRaw, _ := result[constant.KEY_TOKEN_TTL].(float64)
-		ac.mux.Lock()
-		ac.lastRefreshTime = time.Now().Unix()
-		ac.tokenTtl = int64(ttlRaw)
-		ac.tokenRefreshWindow = ac.tokenTtl / 10
-		ac.mux.Unlock()
+	accessToken, ok := result[constant.KEY_ACCESS_TOKEN].(string)
+	if !ok || accessToken == "" {
+		return false, fmt.Errorf("%w: login response missing a valid accessToken: %s", ErrLoginFailed, string(bytes))
 	}
+	ttl, ok := result[constant.KEY_TOKEN_TTL].(float64)
+	if !ok || ttl <= 0 {
+		return false, fmt.Errorf("%w: login response has missing or non-positive tokenTtl: %s", ErrLoginFailed, string(bytes))
+	}
+
+	ac.accessToken.Store(accessToken)
+	ac.mux.Lock()
+	ac.lastRefreshTime = time.Now().Unix()
+	ac.tokenTtl = int64(ttl)
+	ac.tokenRefreshWindow = ac.tokenTtl / 10
+	ac.mux.Unlock()
 
 	return true, nil
 }

@@ -349,3 +349,62 @@ func TestNacosAuthClient_ConcurrentLoginAndUpdateServerList(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+func TestNacosAuthClient_Login_InvalidSuccessResponses(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]interface{}
+	}{
+		{"no accessToken", map[string]interface{}{constant.KEY_TOKEN_TTL: float64(10)}},
+		{"empty accessToken", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "", constant.KEY_TOKEN_TTL: float64(10)}},
+		{"non-string accessToken", map[string]interface{}{constant.KEY_ACCESS_TOKEN: float64(123), constant.KEY_TOKEN_TTL: float64(10)}},
+		{"missing tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok"}},
+		{"zero tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(0)}},
+		{"negative tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(-5)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockAgent := &MockHttpAgent{
+				PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: constant.RESPONSE_CODE_SUCCESS,
+						Body:       NewMockResponseBody(tc.body),
+					}, nil
+				},
+			}
+			client := NewNacosAuthClient(
+				constant.ClientConfig{Username: "u", Password: "p"},
+				[]constant.ServerConfig{{IpAddr: "localhost"}},
+				mockAgent,
+			)
+			success, err := client.Login()
+			assert.False(t, success, "invalid success response must not report success")
+			assert.Error(t, err)
+			assert.True(t, errors.Is(err, ErrLoginFailed), "invalid success response should wrap ErrLoginFailed")
+			assert.Empty(t, client.GetAccessToken(), "no token should be stored")
+		})
+	}
+}
+
+func TestNacosAuthClient_Login_ValidResponseStillSucceeds(t *testing.T) {
+	mockAgent := &MockHttpAgent{
+		PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: constant.RESPONSE_CODE_SUCCESS,
+				Body: NewMockResponseBody(map[string]interface{}{
+					constant.KEY_ACCESS_TOKEN: "valid-token",
+					constant.KEY_TOKEN_TTL:    float64(18000),
+				}),
+			}, nil
+		},
+	}
+	client := NewNacosAuthClient(
+		constant.ClientConfig{Username: "u", Password: "p"},
+		[]constant.ServerConfig{{IpAddr: "localhost"}},
+		mockAgent,
+	)
+	success, err := client.Login()
+	assert.True(t, success)
+	assert.NoError(t, err)
+	assert.Equal(t, "valid-token", client.GetAccessToken())
+}
