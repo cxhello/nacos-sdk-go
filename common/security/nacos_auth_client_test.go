@@ -382,6 +382,9 @@ func TestNacosAuthClient_Login_InvalidSuccessResponses(t *testing.T) {
 			assert.Error(t, err)
 			assert.True(t, errors.Is(err, ErrLoginFailed), "invalid success response should wrap ErrLoginFailed")
 			assert.Empty(t, client.GetAccessToken(), "no token should be stored")
+
+			_, armed := client.refreshDeadlineUnix()
+			assert.False(t, armed, "a rejected login response must not arm the refresh state")
 		})
 	}
 }
@@ -439,4 +442,20 @@ func TestNacosAuthClient_NextRefreshDelay_ClampsPastDeadline(t *testing.T) {
 	client.tokenRefreshWindow = 1
 	client.mux.Unlock()
 	assert.Equal(t, minRefreshDelay, client.nextRefreshDelay(), "a passed deadline must not spin the timer")
+}
+
+func TestNacosAuthClient_NextRefreshDelay_FutureDeadline(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	now := time.Now().Unix()
+	client.mux.Lock()
+	client.lastRefreshTime = now - 3
+	client.tokenTtl = 10
+	client.tokenRefreshWindow = 1
+	client.mux.Unlock()
+
+	// deadline = lastRefreshTime + ttl - 2*window = (now-3) + 8 = now + 5.
+	// The old, buggy rule scheduled ttl-window = 9s from now instead.
+	delay := client.nextRefreshDelay()
+	assert.True(t, delay == 5*time.Second || delay == 4*time.Second,
+		"expected ~5s anchored to lastRefreshTime, got %v (the old ttl-window rule would give 9s)", delay)
 }

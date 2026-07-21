@@ -215,16 +215,22 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 	if !ok || accessToken == "" {
 		return false, fmt.Errorf("%w: login response missing a valid accessToken: %s", ErrLoginFailed, string(bytes))
 	}
-	ttl, ok := result[constant.KEY_TOKEN_TTL].(float64)
-	if !ok || ttl <= 0 {
+	ttlRaw, ok := result[constant.KEY_TOKEN_TTL].(float64)
+	ttlSeconds := int64(ttlRaw)
+	if !ok || ttlSeconds <= 0 {
 		return false, fmt.Errorf("%w: login response has missing or non-positive tokenTtl: %s", ErrLoginFailed, string(bytes))
 	}
 
 	ac.accessToken.Store(accessToken)
 	ac.mux.Lock()
 	ac.lastRefreshTime = time.Now().Unix()
-	ac.tokenTtl = int64(ttl)
+	ac.tokenTtl = ttlSeconds
 	ac.tokenRefreshWindow = ac.tokenTtl / 10
+	if ac.tokenRefreshWindow < 1 {
+		// keep at least one second of margin so the refresh deadline never
+		// collapses onto the expiry instant for very short TTLs
+		ac.tokenRefreshWindow = 1
+	}
 	ac.mux.Unlock()
 
 	return true, nil

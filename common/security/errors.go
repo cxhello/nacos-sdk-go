@@ -21,10 +21,12 @@ import (
 	"fmt"
 )
 
-// ErrLoginFailed marks an auth login failure: the login endpoint returned a
-// non-200 response, so no access token was issued. NewNacosServer aborts client
-// construction on this error only when ClientConfig.FailOnAuthError is set.
-// Transport errors (server unreachable) are not wrapped in this and stay
+// ErrLoginFailed marks an auth login failure: either the login endpoint
+// returned a non-200 response, or it returned 200 with a body that carries no
+// usable token (missing/empty/non-string accessToken, or missing/non-positive
+// tokenTtl) — in both cases no access token was issued. NewNacosServer aborts
+// client construction on this error only when ClientConfig.FailOnAuthError is
+// set. Transport errors (server unreachable) are not wrapped in this and stay
 // transient, always retried by the auto-refresh loop.
 var ErrLoginFailed = errors.New("nacos auth login failed")
 
