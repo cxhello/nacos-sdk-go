@@ -86,6 +86,9 @@ func TestIntegrationAuth_WrongPasswordDefaultNoFailFast(t *testing.T) {
 		ClientConfig:  &cc,
 		ServerConfigs: sc,
 	})
-	assert.NoError(t, err, "default behavior must not abort construction on bad credentials")
-	assert.NotNil(t, client)
+	require.NoError(t, err, "default behavior must not abort construction on bad credentials")
+	require.NotNil(t, client)
+	// Close it: otherwise its auth refresh task keeps retrying the deliberately
+	// wrong password for the rest of the integration run.
+	defer client.CloseClient()
 }

@@ -110,24 +110,29 @@ func NewConfigClientWithRamCredentialProvider(nc nacos_client.INacosClient, prov
 	config.INacosClient = nc
 	clientConfig, err := nc.GetClientConfig()
 	if err != nil {
+		config.cancel()
 		return nil, err
 	}
 	serverConfig, err := nc.GetServerConfig()
 	if err != nil {
+		config.cancel()
 		return nil, err
 	}
 	httpAgent, err := nc.GetHttpAgent()
 	if err != nil {
+		config.cancel()
 		return nil, err
 	}
 
 	if err = initLogger(clientConfig); err != nil {
+		config.cancel()
 		return nil, err
 	}
 	clientConfig.CacheDir = clientConfig.CacheDir + string(os.PathSeparator) + "config"
 	config.configCacheDir = clientConfig.CacheDir
 
 	if config.configProxy, err = NewConfigProxyWithRamCredentialProvider(config.ctx, serverConfig, clientConfig, httpAgent, provider); err != nil {
+		config.cancel()
 		return nil, err
 	}
 
@@ -145,6 +150,7 @@ func NewConfigClientWithRamCredentialProvider(nc nacos_client.INacosClient, prov
 
 	uid, err := uuid.NewV4()
 	if err != nil {
+		config.cancel()
 		return nil, err
 	}
 
