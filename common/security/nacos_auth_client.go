@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -134,15 +135,25 @@ func (ac *NacosAuthClient) Login() (bool, error) {
 	copy(servers, ac.serverCfgs)
 	ac.mux.Unlock()
 
-	var throwable error = nil
+	// Keep any credential failure even when a later server only yields a
+	// transport error, so FailOnAuthError does not depend on server order.
+	var credentialErr, lastErr error
 	for i := 0; i < len(servers); i++ {
 		result, err := ac.login(servers[i])
-		throwable = err
 		if result {
 			return true, nil
 		}
+		if err != nil {
+			lastErr = err
+			if credentialErr == nil && errors.Is(err, ErrLoginFailed) {
+				credentialErr = err
+			}
+		}
 	}
-	return false, throwable
+	if credentialErr != nil {
+		return false, credentialErr
+	}
+	return false, lastErr
 }
 
 func (ac *NacosAuthClient) UpdateServerList(serverList []constant.ServerConfig) {
@@ -211,14 +222,19 @@ func (ac *NacosAuthClient) login(server constant.ServerConfig) (bool, error) {
 		return false, err
 	}
 
+	// NOTE: never put the raw response body in these errors. They are logged by
+	// SecurityProxy.Login/AutoRefresh and returned to callers, and a 200 body can
+	// carry a usable access token — including it would leak the token into
+	// application logs. Report only non-sensitive details.
 	accessToken, ok := result[constant.KEY_ACCESS_TOKEN].(string)
 	if !ok || accessToken == "" {
-		return false, fmt.Errorf("%w: login response missing a valid accessToken: %s", ErrLoginFailed, string(bytes))
+		return false, fmt.Errorf("%w: login response has no usable accessToken", ErrLoginFailed)
 	}
 	ttlRaw, ok := result[constant.KEY_TOKEN_TTL].(float64)
 	ttlSeconds := int64(ttlRaw)
 	if !ok || ttlSeconds <= 0 {
-		return false, fmt.Errorf("%w: login response has missing or non-positive tokenTtl: %s", ErrLoginFailed, string(bytes))
+		return false, fmt.Errorf("%w: login response has missing or non-positive tokenTtl: %v",
+			ErrLoginFailed, result[constant.KEY_TOKEN_TTL])
 	}
 
 	ac.accessToken.Store(accessToken)

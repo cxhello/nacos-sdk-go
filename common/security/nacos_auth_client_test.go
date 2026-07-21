@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -361,6 +362,7 @@ func TestNacosAuthClient_Login_InvalidSuccessResponses(t *testing.T) {
 		{"missing tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok"}},
 		{"zero tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(0)}},
 		{"negative tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(-5)}},
+		{"sub-second tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(0.5)}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -458,4 +460,65 @@ func TestNacosAuthClient_NextRefreshDelay_FutureDeadline(t *testing.T) {
 	delay := client.nextRefreshDelay()
 	assert.True(t, delay == 5*time.Second || delay == 4*time.Second,
 		"expected ~5s anchored to lastRefreshTime, got %v (the old ttl-window rule would give 9s)", delay)
+}
+
+func TestNacosAuthClient_Login_ErrorDoesNotLeakAccessToken(t *testing.T) {
+	const secret = "super-secret-access-token"
+	mockAgent := &MockHttpAgent{
+		PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+			// A usable accessToken but no tokenTtl: rejected on the ttl check, at
+			// which point the raw body still carries a valid token.
+			return &http.Response{
+				StatusCode: constant.RESPONSE_CODE_SUCCESS,
+				Body:       NewMockResponseBody(map[string]interface{}{constant.KEY_ACCESS_TOKEN: secret}),
+			}, nil
+		},
+	}
+	client := NewNacosAuthClient(
+		constant.ClientConfig{Username: "u", Password: "p"},
+		[]constant.ServerConfig{{IpAddr: "localhost"}},
+		mockAgent,
+	)
+
+	success, err := client.Login()
+	assert.False(t, success)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrLoginFailed))
+	assert.NotContains(t, err.Error(), secret,
+		"the login error is logged by SecurityProxy/AutoRefresh and must not leak the access token")
+}
+
+func TestNacosAuthClient_Login_PreservesCredentialErrorAcrossServers(t *testing.T) {
+	// 10.0.0.1 rejects the credentials (401 -> ErrLoginFailed);
+	// 10.0.0.2 is unreachable (transport error, stays transient).
+	newClient := func(servers []constant.ServerConfig) *NacosAuthClient {
+		agent := &MockHttpAgent{
+			PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+				if strings.Contains(url, "10.0.0.1") {
+					return &http.Response{
+						StatusCode: http.StatusUnauthorized,
+						Body:       NewMockResponseBody("unknown user!"),
+					}, nil
+				}
+				return nil, errors.New("dial tcp 10.0.0.2:8848: connect: connection refused")
+			},
+		}
+		return NewNacosAuthClient(constant.ClientConfig{Username: "u", Password: "p"}, servers, agent)
+	}
+
+	t.Run("credential first then transport", func(t *testing.T) {
+		client := newClient([]constant.ServerConfig{{IpAddr: "10.0.0.1"}, {IpAddr: "10.0.0.2"}})
+		success, err := client.Login()
+		assert.False(t, success)
+		assert.True(t, errors.Is(err, ErrLoginFailed),
+			"a credential failure must survive a later transport error, got %v", err)
+	})
+
+	t.Run("transport first then credential", func(t *testing.T) {
+		client := newClient([]constant.ServerConfig{{IpAddr: "10.0.0.2"}, {IpAddr: "10.0.0.1"}})
+		success, err := client.Login()
+		assert.False(t, success)
+		assert.True(t, errors.Is(err, ErrLoginFailed),
+			"a credential failure must be reported regardless of server order, got %v", err)
+	})
 }
