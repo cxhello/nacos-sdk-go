@@ -18,6 +18,12 @@ package nacos_server
 
 import (
 	"context"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strconv"
 	"testing"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
@@ -184,4 +190,57 @@ func TestNacosServer_UpdateServerListForSecurityLogin(t *testing.T) {
 	client, ok := nacosAuthClient.(*security.NacosAuthClient)
 	assert.True(t, ok)
 	assert.Equal(t, server.GetServerList(), client.GetServerList())
+}
+
+// newUnauthorizedLoginServer starts an httptest server whose login endpoint
+// always returns 401, and returns a ServerConfig pointing at it.
+func newUnauthorizedLoginServer(t *testing.T) (*httptest.Server, constant.ServerConfig) {
+	t.Helper()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte("unknown user!"))
+	}))
+	u, err := url.Parse(ts.URL)
+	assert.NoError(t, err)
+	host, portStr, err := net.SplitHostPort(u.Host)
+	assert.NoError(t, err)
+	port, err := strconv.ParseUint(portStr, 10, 64)
+	assert.NoError(t, err)
+	return ts, constant.ServerConfig{Scheme: "http", IpAddr: host, Port: port, ContextPath: "/nacos"}
+}
+
+func TestNewNacosServer_FailOnAuthError_AbortsOnCredentialError(t *testing.T) {
+	ts, sc := newUnauthorizedLoginServer(t)
+	defer ts.Close()
+
+	clientConfig := constant.ClientConfig{
+		Username:        "wrong",
+		Password:        "wrong",
+		TimeoutMs:       3000,
+		FailOnAuthError: true,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // stop the AutoRefresh goroutine before the httptest server closes
+	_, err := NewNacosServer(ctx, []constant.ServerConfig{sc},
+		clientConfig, &http_agent.HttpAgent{}, 3000, "", nil)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, security.ErrLoginFailed))
+}
+
+func TestNewNacosServer_FailOnAuthError_Disabled_DoesNotAbort(t *testing.T) {
+	ts, sc := newUnauthorizedLoginServer(t)
+	defer ts.Close()
+
+	clientConfig := constant.ClientConfig{
+		Username:        "wrong",
+		Password:        "wrong",
+		TimeoutMs:       3000,
+		FailOnAuthError: false,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel() // stop the AutoRefresh goroutine before the httptest server closes
+	server, err := NewNacosServer(ctx, []constant.ServerConfig{sc},
+		clientConfig, &http_agent.HttpAgent{}, 3000, "", nil)
+	assert.NoError(t, err)
+	assert.NotNil(t, server)
 }

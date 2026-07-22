@@ -252,3 +252,10 @@ func WithClientIP(clientIP string) ClientOption {
 		config.ClientIP = clientIP
 	}
 }
+
+// WithFailOnAuthError ...
+func WithFailOnAuthError(failOnAuthError bool) ClientOption {
+	return func(config *ClientConfig) {
+		config.FailOnAuthError = failOnAuthError
+	}
+}

@@ -62,6 +62,7 @@ type ClientConfig struct {
 	ClusterName          string                   // the address server  clusterName
 	AppConnLabels        map[string]string        // app conn labels
 	ClientIP             string                   // the custom client ip, if not set, will use local ip auto detected
+	FailOnAuthError      bool                     // if true, NewClient returns an error when the initial login gets any non-200 response from the auth endpoint (Nacos 2.x/3.x report rejected credentials with an inconsistent mix of 401/403/500) or a 200 response carrying no usable token; transport errors (server unreachable) stay retryable. Default false keeps backward-compatible behavior
 }
 
 type ClientLogSamplingConfig struct {

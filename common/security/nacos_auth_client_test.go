@@ -4,9 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -284,6 +287,238 @@ func TestNacosAuthClient_LoginFailure(t *testing.T) {
 
 	success, err := client.Login()
 	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrLoginFailed), "401 must be classified as credential error")
 	assert.False(t, success)
 	assert.Empty(t, client.GetAccessToken())
+}
+
+func TestNacosAuthClient_ConcurrentLoginAndUpdateServerList(t *testing.T) {
+	mockAgent := &MockHttpAgent{
+		PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: constant.RESPONSE_CODE_SUCCESS,
+				Body: NewMockResponseBody(map[string]interface{}{
+					constant.KEY_ACCESS_TOKEN: "concurrent-token",
+					constant.KEY_TOKEN_TTL:    float64(10),
+				}),
+			}, nil
+		},
+	}
+	client := NewNacosAuthClient(
+		constant.ClientConfig{Username: "u", Password: "p"},
+		[]constant.ServerConfig{{IpAddr: "localhost"}},
+		mockAgent,
+	)
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				client.UpdateServerList([]constant.ServerConfig{{IpAddr: "127.0.0.1"}, {IpAddr: "localhost"}})
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_, _ = client.Login()
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				_ = client.GetServerList()
+			}
+		}
+	}()
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+}
+
+func TestNacosAuthClient_Login_InvalidSuccessResponses(t *testing.T) {
+	cases := []struct {
+		name string
+		body map[string]interface{}
+	}{
+		{"no accessToken", map[string]interface{}{constant.KEY_TOKEN_TTL: float64(10)}},
+		{"empty accessToken", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "", constant.KEY_TOKEN_TTL: float64(10)}},
+		{"non-string accessToken", map[string]interface{}{constant.KEY_ACCESS_TOKEN: float64(123), constant.KEY_TOKEN_TTL: float64(10)}},
+		{"missing tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok"}},
+		{"zero tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(0)}},
+		{"negative tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(-5)}},
+		{"sub-second tokenTtl", map[string]interface{}{constant.KEY_ACCESS_TOKEN: "tok", constant.KEY_TOKEN_TTL: float64(0.5)}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mockAgent := &MockHttpAgent{
+				PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+					return &http.Response{
+						StatusCode: constant.RESPONSE_CODE_SUCCESS,
+						Body:       NewMockResponseBody(tc.body),
+					}, nil
+				},
+			}
+			client := NewNacosAuthClient(
+				constant.ClientConfig{Username: "u", Password: "p"},
+				[]constant.ServerConfig{{IpAddr: "localhost"}},
+				mockAgent,
+			)
+			success, err := client.Login()
+			assert.False(t, success, "invalid success response must not report success")
+			assert.Error(t, err)
+			assert.True(t, errors.Is(err, ErrLoginFailed), "invalid success response should wrap ErrLoginFailed")
+			assert.Empty(t, client.GetAccessToken(), "no token should be stored")
+
+			_, armed := client.refreshDeadlineUnix()
+			assert.False(t, armed, "a rejected login response must not arm the refresh state")
+		})
+	}
+}
+
+func TestNacosAuthClient_Login_ValidResponseStillSucceeds(t *testing.T) {
+	mockAgent := &MockHttpAgent{
+		PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: constant.RESPONSE_CODE_SUCCESS,
+				Body: NewMockResponseBody(map[string]interface{}{
+					constant.KEY_ACCESS_TOKEN: "valid-token",
+					constant.KEY_TOKEN_TTL:    float64(18000),
+				}),
+			}, nil
+		},
+	}
+	client := NewNacosAuthClient(
+		constant.ClientConfig{Username: "u", Password: "p"},
+		[]constant.ServerConfig{{IpAddr: "localhost"}},
+		mockAgent,
+	)
+	success, err := client.Login()
+	assert.True(t, success)
+	assert.NoError(t, err)
+	assert.Equal(t, "valid-token", client.GetAccessToken())
+}
+
+func TestNacosAuthClient_RefreshDeadline_Deterministic(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	client.mux.Lock()
+	client.lastRefreshTime = 1_000_000
+	client.tokenTtl = 10
+	client.tokenRefreshWindow = 1
+	client.mux.Unlock()
+
+	deadline, ok := client.refreshDeadlineUnix()
+	assert.True(t, ok)
+	// lastRefreshTime + ttl - 2*window = 1000000 + 10 - 2 = 1000008
+	assert.Equal(t, int64(1_000_008), deadline, "deadline must be two windows before expiry")
+}
+
+func TestNacosAuthClient_RefreshDeadline_NotLoggedIn(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	_, ok := client.refreshDeadlineUnix()
+	assert.False(t, ok, "no deadline before a successful login")
+	assert.Equal(t, retryDelay, client.nextRefreshDelay(), "unauthenticated delay is the retry cadence")
+}
+
+func TestNacosAuthClient_NextRefreshDelay_ClampsPastDeadline(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	client.mux.Lock()
+	// deadline far in the past → raw delay is negative → must clamp to minRefreshDelay
+	client.lastRefreshTime = 1
+	client.tokenTtl = 10
+	client.tokenRefreshWindow = 1
+	client.mux.Unlock()
+	assert.Equal(t, minRefreshDelay, client.nextRefreshDelay(), "a passed deadline must not spin the timer")
+}
+
+func TestNacosAuthClient_NextRefreshDelay_FutureDeadline(t *testing.T) {
+	client := NewNacosAuthClient(constant.ClientConfig{Username: "u"}, nil, nil)
+	now := time.Now().Unix()
+	client.mux.Lock()
+	client.lastRefreshTime = now - 3
+	client.tokenTtl = 10
+	client.tokenRefreshWindow = 1
+	client.mux.Unlock()
+
+	// deadline = lastRefreshTime + ttl - 2*window = (now-3) + 8 = now + 5.
+	// The old, buggy rule scheduled ttl-window = 9s from now instead.
+	delay := client.nextRefreshDelay()
+	assert.True(t, delay == 5*time.Second || delay == 4*time.Second,
+		"expected ~5s anchored to lastRefreshTime, got %v (the old ttl-window rule would give 9s)", delay)
+}
+
+func TestNacosAuthClient_Login_ErrorDoesNotLeakAccessToken(t *testing.T) {
+	const secret = "super-secret-access-token"
+	mockAgent := &MockHttpAgent{
+		PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+			// A usable accessToken but no tokenTtl: rejected on the ttl check, at
+			// which point the raw body still carries a valid token.
+			return &http.Response{
+				StatusCode: constant.RESPONSE_CODE_SUCCESS,
+				Body:       NewMockResponseBody(map[string]interface{}{constant.KEY_ACCESS_TOKEN: secret}),
+			}, nil
+		},
+	}
+	client := NewNacosAuthClient(
+		constant.ClientConfig{Username: "u", Password: "p"},
+		[]constant.ServerConfig{{IpAddr: "localhost"}},
+		mockAgent,
+	)
+
+	success, err := client.Login()
+	assert.False(t, success)
+	assert.Error(t, err)
+	assert.True(t, errors.Is(err, ErrLoginFailed))
+	assert.NotContains(t, err.Error(), secret,
+		"the login error is logged by SecurityProxy/AutoRefresh and must not leak the access token")
+}
+
+func TestNacosAuthClient_Login_PreservesCredentialErrorAcrossServers(t *testing.T) {
+	// 10.0.0.1 rejects the credentials (401 -> ErrLoginFailed);
+	// 10.0.0.2 is unreachable (transport error, stays transient).
+	newClient := func(servers []constant.ServerConfig) *NacosAuthClient {
+		agent := &MockHttpAgent{
+			PostFunc: func(url string, header http.Header, timeoutMs uint64, params map[string]string) (*http.Response, error) {
+				if strings.Contains(url, "10.0.0.1") {
+					return &http.Response{
+						StatusCode: http.StatusUnauthorized,
+						Body:       NewMockResponseBody("unknown user!"),
+					}, nil
+				}
+				return nil, errors.New("dial tcp 10.0.0.2:8848: connect: connection refused")
+			},
+		}
+		return NewNacosAuthClient(constant.ClientConfig{Username: "u", Password: "p"}, servers, agent)
+	}
+
+	t.Run("credential first then transport", func(t *testing.T) {
+		client := newClient([]constant.ServerConfig{{IpAddr: "10.0.0.1"}, {IpAddr: "10.0.0.2"}})
+		success, err := client.Login()
+		assert.False(t, success)
+		assert.True(t, errors.Is(err, ErrLoginFailed),
+			"a credential failure must survive a later transport error, got %v", err)
+	})
+
+	t.Run("transport first then credential", func(t *testing.T) {
+		client := newClient([]constant.ServerConfig{{IpAddr: "10.0.0.2"}, {IpAddr: "10.0.0.1"}})
+		success, err := client.Login()
+		assert.False(t, success)
+		assert.True(t, errors.Is(err, ErrLoginFailed),
+			"a credential failure must be reported regardless of server order, got %v", err)
+	})
 }
