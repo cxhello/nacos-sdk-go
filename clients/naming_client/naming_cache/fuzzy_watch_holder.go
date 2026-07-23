@@ -273,8 +273,8 @@ func parseServiceKey(serviceKey string) (namespace, group, service string, err e
 
 // matchPattern reports whether a service (namespace/group/service) is covered
 // by a groupKeyPattern (namespace>>groupPattern>>servicePattern). Namespace
-// must be exact; group and service match by itemMatch (exact, trailing-"*"
-// prefix, or "*" for all).
+// must be exact; group and service match by itemMatch (exact, "*", prefix "x*",
+// suffix "*x" or contains "*x*").
 func matchPattern(pattern, namespace, group, service string) bool {
 	parts := strings.Split(pattern, constant.FUZZY_WATCH_PATTERN_SPLITTER)
 	if len(parts) != 3 {
@@ -283,12 +283,22 @@ func matchPattern(pattern, namespace, group, service string) bool {
 	return parts[0] == namespace && itemMatch(parts[1], group) && itemMatch(parts[2], service)
 }
 
+// itemMatch mirrors com.alibaba.nacos.common.utils.FuzzyGroupKeyPattern.itemMatched
+// (alibaba/nacos, develop branch), which supports five modes. Order matters:
+// "*x*" (contains) must be tested before "*x" (suffix) and "x*" (prefix), since
+// a contains pattern also satisfies HasPrefix("*")/HasSuffix("*").
+// https://github.com/alibaba/nacos/blob/develop/common/src/main/java/com/alibaba/nacos/common/utils/FuzzyGroupKeyPattern.java
 func itemMatch(pattern, value string) bool {
-	if pattern == "*" {
+	switch {
+	case pattern == "*": // match all
 		return true
-	}
-	if strings.HasSuffix(pattern, "*") {
+	case strings.HasPrefix(pattern, "*") && strings.HasSuffix(pattern, "*"): // contains "*x*"
+		return strings.Contains(value, pattern[1:len(pattern)-1])
+	case strings.HasPrefix(pattern, "*"): // suffix "*x"
+		return strings.HasSuffix(value, pattern[1:])
+	case strings.HasSuffix(pattern, "*"): // prefix "x*"
 		return strings.HasPrefix(value, pattern[:len(pattern)-1])
+	default: // exact
+		return pattern == value
 	}
-	return pattern == value
 }

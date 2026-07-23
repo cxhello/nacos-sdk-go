@@ -191,6 +191,79 @@ func TestHolderChangeNotifyMatchingPatternOnly(t *testing.T) {
 	assert.Empty(t, holder.ReceivedGroupKeys("public>>DEFAULT_GROUP>>order*"))
 }
 
+func TestItemMatchFiveModes(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		value   string
+		want    bool
+	}{
+		{"exact hit", "order", "order", true},
+		{"exact miss", "order", "orders", false},
+		{"all", "*", "anything", true},
+		{"prefix hit", "order*", "order-service", true},
+		{"prefix miss", "order*", "user-service", false},
+		{"suffix hit", "*order", "cancel-order", true},
+		{"suffix miss", "*order", "order-service", false},
+		{"contains hit", "*order*", "my-order-service", true},
+		{"contains miss", "*order*", "user-service", false},
+		// explicit regressions for the two modes the naive matcher dropped:
+		{"suffix regression not treated as exact", "*order", "the-order", true},
+		{"contains regression not treated as prefix", "*order*", "an-order-x", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, itemMatch(c.pattern, c.value))
+		})
+	}
+}
+
+func TestMatchPatternAllModesForBothSegments(t *testing.T) {
+	cases := []struct {
+		name    string
+		pattern string
+		want    bool
+	}{
+		{"exact group + prefix service", "public>>DEFAULT_GROUP>>order*", true},
+		{"suffix group hits", "public>>*GROUP>>order-service", true},
+		{"contains group hits", "public>>*FAULT*>>order-service", true},
+		{"suffix service hits", "public>>DEFAULT_GROUP>>*service", true},
+		{"contains service hits", "public>>DEFAULT_GROUP>>*der-ser*", true},
+		{"all group and service", "public>>*>>*", true},
+		{"namespace must be exact", "other>>*>>*", false},
+		{"suffix service misses", "public>>DEFAULT_GROUP>>*order", false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, matchPattern(c.pattern, "public", "DEFAULT_GROUP", "order-service"))
+		})
+	}
+}
+
+func TestHandleChangeNotifyContainsPatternReceivesEvent(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	sink := &eventSink{}
+	// a contains-mode pattern: previously its post-init change-notify was dropped.
+	holder.RegisterPattern("public>>DEFAULT_GROUP>>*order*", sink.cb)
+
+	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@my-order-service", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+
+	events := sink.snapshot()
+	require.Len(t, events, 1, "contains-mode pattern must receive its change-notify")
+	assert.Equal(t, "my-order-service", events[0].ServiceName)
+	assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, events[0].ChangedType)
+}
+
+func TestHandleChangeNotifySuffixPatternReceivesEvent(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	sink := &eventSink{}
+	holder.RegisterPattern("public>>DEFAULT_GROUP>>*service", sink.cb)
+
+	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-service", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+
+	require.Len(t, sink.snapshot(), 1, "suffix-mode pattern must receive its change-notify")
+}
+
 func TestHolderDuplicateRegisterDedupesCallback(t *testing.T) {
 	holder := NewFuzzyWatchServiceListHolder("public")
 	sink := &eventSink{}

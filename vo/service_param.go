@@ -99,8 +99,9 @@ type SelectOneHealthInstanceParam struct {
 }
 
 // FuzzyWatchParam registers a fuzzy watch on every service whose name and
-// group match the given patterns. A pattern is either an exact string, a
-// trailing-wildcard prefix (e.g. "order*") or "*" for match-all.
+// group match the given patterns. Each pattern supports five modes: exact
+// ("order"), match-all ("*"), prefix ("order*"), suffix ("*order") and
+// contains ("*order*").
 type FuzzyWatchParam struct {
 	ServiceNamePattern string                                  `param:"serviceNamePattern"` //required
 	GroupNamePattern   string                                  `param:"groupNamePattern"`   //optional,default:DEFAULT_GROUP

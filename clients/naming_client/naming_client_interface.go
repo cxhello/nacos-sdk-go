@@ -110,7 +110,8 @@ type INamingClient interface {
 	Unsubscribe(param *vo.SubscribeParam) error
 
 	// FuzzyWatch use to watch add/delete of services matching a pattern
-	// ServiceNamePattern require (exact, "prefix*" or "*")
+	// ServiceNamePattern require, supports five modes: exact ("order"),
+	//   match-all ("*"), prefix ("order*"), suffix ("*order"), contains ("*order*")
 	// GroupNamePattern optional,default:DEFAULT_GROUP
 	// WatchCallback require
 	FuzzyWatch(param *vo.FuzzyWatchParam) error
