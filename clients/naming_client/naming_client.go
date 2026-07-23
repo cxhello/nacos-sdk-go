@@ -45,6 +45,7 @@ type NamingClient struct {
 	cancel            context.CancelFunc
 	serviceProxy      naming_proxy.INamingProxy
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	fuzzyWatchHolder  *naming_cache.FuzzyWatchServiceListHolder
 	isClosed          bool
 	mutex             sync.Mutex
 }
@@ -91,6 +92,13 @@ func NewNamingClientWithRamCredentialProvider(nc nacos_client.INacosClient, prov
 		cancel()
 		naming.serviceInfoHolder.Close()
 		return naming, err
+	}
+
+	// The delegate owns the fuzzy watch holder (it is shared with the gRPC
+	// push handlers and redo listener). Grab it so the client API can register
+	// and remove pattern callbacks against the same instance.
+	if delegate, ok := naming.serviceProxy.(*NamingProxyDelegate); ok {
+		naming.fuzzyWatchHolder = delegate.fuzzyWatchHolder
 	}
 
 	if clientConfig.AsyncUpdateService {
@@ -394,6 +402,55 @@ func (sc *NamingClient) Unsubscribe(param *vo.SubscribeParam) (err error) {
 	}
 
 	return err
+}
+
+// FuzzyWatch registers a fuzzy watch that fires the callback whenever a service
+// whose name/group match the given patterns is added or deleted.
+func (sc *NamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) error {
+	if param.ServiceNamePattern == "" {
+		return errors.New("serviceNamePattern cannot be empty!")
+	}
+	if len(param.GroupNamePattern) == 0 {
+		param.GroupNamePattern = constant.DEFAULT_GROUP
+	}
+	if param.WatchCallback == nil {
+		return errors.New("watchCallback cannot be nil!")
+	}
+	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
+	sc.fuzzyWatchHolder.RegisterPattern(pattern, param.WatchCallback)
+	return sc.serviceProxy.FuzzyWatch(pattern, sc.fuzzyWatchHolder.ReceivedGroupKeys(pattern), true)
+}
+
+// CancelFuzzyWatch removes a fuzzy watch callback. The server-side watch is torn
+// down only once the pattern has no callbacks left.
+func (sc *NamingClient) CancelFuzzyWatch(param *vo.FuzzyWatchParam) error {
+	if param.ServiceNamePattern == "" {
+		return errors.New("serviceNamePattern cannot be empty!")
+	}
+	if len(param.GroupNamePattern) == 0 {
+		param.GroupNamePattern = constant.DEFAULT_GROUP
+	}
+	if param.WatchCallback == nil {
+		return errors.New("watchCallback cannot be nil!")
+	}
+	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
+	if remaining := sc.fuzzyWatchHolder.RemoveCallback(pattern, param.WatchCallback); remaining > 0 {
+		return nil
+	}
+	sc.fuzzyWatchHolder.RemovePattern(pattern)
+	return sc.serviceProxy.CancelFuzzyWatch(pattern)
+}
+
+// buildGroupKeyPattern joins the client's namespace with the group and service
+// patterns into the groupKeyPattern the server matches against
+// (namespace>>groupPattern>>servicePattern).
+func (sc *NamingClient) buildGroupKeyPattern(serviceNamePattern, groupNamePattern string) string {
+	namespace := constant.DEFAULT_NAMESPACE_ID
+	if cfg, err := sc.GetClientConfig(); err == nil && cfg.NamespaceId != "" {
+		namespace = cfg.NamespaceId
+	}
+	return namespace + constant.FUZZY_WATCH_PATTERN_SPLITTER + groupNamePattern +
+		constant.FUZZY_WATCH_PATTERN_SPLITTER + serviceNamePattern
 }
 
 // ServerHealthy ...

@@ -38,6 +38,7 @@ type NamingProxyDelegate struct {
 	httpClientProxy   *naming_http.NamingHttpProxy
 	grpcClientProxy   *naming_grpc.NamingGrpcProxy
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	fuzzyWatchHolder  *naming_cache.FuzzyWatchServiceListHolder
 }
 
 func NewNamingProxyDelegate(ctx context.Context, clientCfg constant.ClientConfig, serverCfgs []constant.ServerConfig,
@@ -68,7 +69,9 @@ func NewNamingProxyDelegateWithRamCredentialProvider(ctx context.Context, client
 		return nil, err
 	}
 
-	grpcClientProxy, err := naming_grpc.NewNamingGrpcProxy(ctx, clientCfg, nacosServer, serviceInfoHolder)
+	fuzzyWatchHolder := naming_cache.NewFuzzyWatchServiceListHolder(clientCfg.NamespaceId)
+
+	grpcClientProxy, err := naming_grpc.NewNamingGrpcProxy(ctx, clientCfg, nacosServer, serviceInfoHolder, fuzzyWatchHolder)
 	if err != nil {
 		return nil, err
 	}
@@ -77,6 +80,7 @@ func NewNamingProxyDelegateWithRamCredentialProvider(ctx context.Context, client
 		httpClientProxy:   httpClientProxy,
 		grpcClientProxy:   grpcClientProxy,
 		serviceInfoHolder: serviceInfoHolder,
+		fuzzyWatchHolder:  fuzzyWatchHolder,
 	}, nil
 }
 
@@ -133,6 +137,14 @@ func (proxy *NamingProxyDelegate) Subscribe(serviceName, groupName string, clust
 func (proxy *NamingProxyDelegate) Unsubscribe(serviceName, groupName, clusters string) error {
 	proxy.serviceInfoHolder.StopUpdateIfContain(util.GetGroupName(serviceName, groupName), clusters)
 	return proxy.grpcClientProxy.Unsubscribe(serviceName, groupName, clusters)
+}
+
+func (proxy *NamingProxyDelegate) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
+	return proxy.grpcClientProxy.FuzzyWatch(groupKeyPattern, receivedGroupKeys, isInitializing)
+}
+
+func (proxy *NamingProxyDelegate) CancelFuzzyWatch(groupKeyPattern string) error {
+	return proxy.grpcClientProxy.CancelFuzzyWatch(groupKeyPattern)
 }
 
 func (proxy *NamingProxyDelegate) CloseClient() {

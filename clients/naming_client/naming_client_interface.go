@@ -109,6 +109,18 @@ type INamingClient interface {
 	// SubscribeCallback require
 	Unsubscribe(param *vo.SubscribeParam) error
 
+	// FuzzyWatch use to watch add/delete of services matching a pattern
+	// ServiceNamePattern require (exact, "prefix*" or "*")
+	// GroupNamePattern optional,default:DEFAULT_GROUP
+	// WatchCallback require
+	FuzzyWatch(param *vo.FuzzyWatchParam) error
+
+	// CancelFuzzyWatch use to cancel a fuzzy watch
+	// ServiceNamePattern require
+	// GroupNamePattern optional,default:DEFAULT_GROUP
+	// WatchCallback require
+	CancelFuzzyWatch(param *vo.FuzzyWatchParam) error
+
 	// GetAllServicesInfo use to get all service info by page
 	GetAllServicesInfo(param vo.GetAllServiceInfoParam) (model.ServiceList, error)
 

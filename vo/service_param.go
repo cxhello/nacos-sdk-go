@@ -97,3 +97,12 @@ type SelectOneHealthInstanceParam struct {
 	ServiceName string   `param:"serviceName"` //required
 	GroupName   string   `param:"groupName"`   //optional,default:DEFAULT_GROUP
 }
+
+// FuzzyWatchParam registers a fuzzy watch on every service whose name and
+// group match the given patterns. A pattern is either an exact string, a
+// trailing-wildcard prefix (e.g. "order*") or "*" for match-all.
+type FuzzyWatchParam struct {
+	ServiceNamePattern string                                  `param:"serviceNamePattern"` //required
+	GroupNamePattern   string                                  `param:"groupNamePattern"`   //optional,default:DEFAULT_GROUP
+	WatchCallback      func(event model.FuzzyWatchChangeEvent) //required
+}

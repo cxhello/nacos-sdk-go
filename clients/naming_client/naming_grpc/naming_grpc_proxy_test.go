@@ -25,7 +25,9 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_proxy"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
@@ -427,4 +429,57 @@ func TestDeregisterInstanceRejectsOutOfRangePort(t *testing.T) {
 	retained, isBatch := proxy.eventListener.GetBatchInstancesForRedo("svc", "group")
 	assert.True(t, isBatch)
 	assert.Equal(t, []model.Instance{a, b}, retained)
+}
+
+func TestFuzzyWatchSendsWatchRequest(t *testing.T) {
+	proxy, sent := newTestProxy()
+	err := proxy.FuzzyWatch("public>>DEFAULT_GROUP>>order*", nil, true)
+	require.NoError(t, err)
+
+	require.Len(t, *sent, 1)
+	req, ok := (*sent)[0].(*rpc_request.NamingFuzzyWatchRequest)
+	require.True(t, ok, "FuzzyWatch sends a NamingFuzzyWatchRequest")
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, req.WatchType)
+	assert.True(t, req.IsInitializing, "first watch is initializing")
+	assert.Equal(t, "public>>DEFAULT_GROUP>>order*", req.GroupKeyPattern)
+	// pattern is cached for redo
+	assert.True(t, proxy.eventListener.fuzzyWatchPatterns.Has("public>>DEFAULT_GROUP>>order*"))
+}
+
+func TestCancelFuzzyWatchSendsCancel(t *testing.T) {
+	proxy, sent := newTestProxy()
+	require.NoError(t, proxy.FuzzyWatch("public>>DEFAULT_GROUP>>order*", nil, true))
+	*sent = nil
+
+	err := proxy.CancelFuzzyWatch("public>>DEFAULT_GROUP>>order*")
+	require.NoError(t, err)
+	require.Len(t, *sent, 1)
+	req := (*sent)[0].(*rpc_request.NamingFuzzyWatchRequest)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, req.WatchType)
+	// pattern is dropped from the redo cache
+	assert.False(t, proxy.eventListener.fuzzyWatchPatterns.Has("public>>DEFAULT_GROUP>>order*"))
+}
+
+func TestRedoResendsFuzzyWatchWithReceivedKeys(t *testing.T) {
+	proxy, sent := newTestProxy()
+	holder := naming_cache.NewFuzzyWatchServiceListHolder("public")
+	proxy.fuzzyWatchHolder = holder
+
+	pattern := "public>>DEFAULT_GROUP>>order*"
+	// initial watch + a synced key the holder now knows about
+	require.NoError(t, proxy.FuzzyWatch(pattern, nil, true))
+	holder.RegisterPattern(pattern, func(model.FuzzyWatchChangeEvent) {})
+	holder.HandleSync(pattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		{ServiceKey: "public@@DEFAULT_GROUP@@order-a", ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE},
+	}, 1, 1)
+	*sent = nil
+
+	proxy.eventListener.redoFuzzyWatch()
+
+	require.Len(t, *sent, 1)
+	req := (*sent)[0].(*rpc_request.NamingFuzzyWatchRequest)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, req.WatchType)
+	assert.False(t, req.IsInitializing, "redo re-sends with isInitializing=false")
+	assert.Equal(t, []string{"public@@DEFAULT_GROUP@@order-a"}, req.ReceivedGroupKeys,
+		"redo carries the holder's current match set for a server-side diff")
 }

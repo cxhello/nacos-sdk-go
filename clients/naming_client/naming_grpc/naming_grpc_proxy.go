@@ -44,6 +44,7 @@ type NamingGrpcProxy struct {
 	rpcClient         rpc.IRpcClient
 	eventListener     *ConnectionEventListener
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	fuzzyWatchHolder  *naming_cache.FuzzyWatchServiceListHolder
 	// send performs the actual server round-trip; it defaults to
 	// requestToServer and is swapped out in tests so the request sequence can
 	// be asserted without a live rpc client.
@@ -67,11 +68,12 @@ type NamingGrpcProxy struct {
 
 // NewNamingGrpcProxy create naming grpc proxy
 func NewNamingGrpcProxy(ctx context.Context, clientCfg constant.ClientConfig, nacosServer *nacos_server.NacosServer,
-	serviceInfoHolder *naming_cache.ServiceInfoHolder) (*NamingGrpcProxy, error) {
+	serviceInfoHolder *naming_cache.ServiceInfoHolder, fuzzyWatchHolder *naming_cache.FuzzyWatchServiceListHolder) (*NamingGrpcProxy, error) {
 	srvProxy := NamingGrpcProxy{
 		clientConfig:      clientCfg,
 		nacosServer:       nacosServer,
 		serviceInfoHolder: serviceInfoHolder,
+		fuzzyWatchHolder:  fuzzyWatchHolder,
 	}
 	srvProxy.send = srvProxy.requestToServer
 
@@ -98,6 +100,16 @@ func NewNamingGrpcProxy(ctx context.Context, clientCfg constant.ClientConfig, na
 	rpcClient.RegisterServerRequestHandler(func() rpc_request.IRequest {
 		return &rpc_request.NotifySubscriberRequest{NamingRequest: &rpc_request.NamingRequest{}}
 	}, &rpc.NamingPushRequestHandler{ServiceInfoHolder: serviceInfoHolder})
+
+	// FuzzyWatch server-push handlers. handleServerRequest only dispatches
+	// payload types that have a registered handler, so without these two the
+	// FUZZY_WATCH_SYNC / CHANGE_NOTIFY pushes would be dropped as "unsupported".
+	rpcClient.RegisterServerRequestHandler(func() rpc_request.IRequest {
+		return &rpc_request.NamingFuzzyWatchSyncRequest{Request: &rpc_request.Request{}}
+	}, &FuzzyWatchSyncRequestHandler{fuzzyWatchHolder: fuzzyWatchHolder})
+	rpcClient.RegisterServerRequestHandler(func() rpc_request.IRequest {
+		return &rpc_request.NamingFuzzyWatchChangeNotifyRequest{Request: &rpc_request.Request{}}
+	}, &FuzzyWatchChangeNotifyRequestHandler{fuzzyWatchHolder: fuzzyWatchHolder})
 
 	srvProxy.eventListener = NewConnectionEventListener(&srvProxy)
 	rpcClient.RegisterConnectionListener(srvProxy.eventListener)
@@ -324,6 +336,47 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 		proxy.eventListener.CacheSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
 	}
 	return err
+}
+
+// FuzzyWatch (re)registers a fuzzy watch on groupKeyPattern. receivedGroupKeys
+// is the client's current known match set (empty on first watch, the holder's
+// set on redo); isInitializing is true only for the first watch, telling the
+// server to send a full INIT sync rather than a diff.
+func (proxy *NamingGrpcProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
+	logger.Infof("fuzzy watch namespaceId:<%s>, pattern:<%s>, isInitializing:<%t>",
+		proxy.clientConfig.NamespaceId, groupKeyPattern, isInitializing)
+	proxy.eventListener.CacheFuzzyWatchForRedo(groupKeyPattern)
+	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
+		constant.FUZZY_WATCH_TYPE_WATCH, receivedGroupKeys, isInitializing)
+	return proxy.sendFuzzyWatch(request, groupKeyPattern)
+}
+
+// CancelFuzzyWatch tears down a fuzzy watch on groupKeyPattern (watchType
+// CANCEL_WATCH) and removes it from the redo cache.
+func (proxy *NamingGrpcProxy) CancelFuzzyWatch(groupKeyPattern string) error {
+	logger.Infof("cancel fuzzy watch namespaceId:<%s>, pattern:<%s>", proxy.clientConfig.NamespaceId, groupKeyPattern)
+	proxy.eventListener.RemoveFuzzyWatchForRedo(groupKeyPattern)
+	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
+		constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, nil, false)
+	return proxy.sendFuzzyWatch(request, groupKeyPattern)
+}
+
+// sendFuzzyWatch sends a fuzzy watch request and surfaces a non-success server
+// reply (e.g. a 2.x server that does not understand the request) as an error
+// rather than swallowing it.
+func (proxy *NamingGrpcProxy) sendFuzzyWatch(request *rpc_request.NamingFuzzyWatchRequest, groupKeyPattern string) error {
+	response, err := proxy.send(request)
+	if err != nil {
+		return err
+	}
+	if response == nil {
+		return errors.Errorf("fuzzy watch pattern:%s watchType:%s got nil response", groupKeyPattern, request.WatchType)
+	}
+	if !response.IsSuccess() {
+		return errors.Errorf("fuzzy watch pattern:%s watchType:%s failed, resultCode:%d message:%s",
+			groupKeyPattern, request.WatchType, response.GetResultCode(), response.GetMessage())
+	}
+	return nil
 }
 
 func (proxy *NamingGrpcProxy) CloseClient() {

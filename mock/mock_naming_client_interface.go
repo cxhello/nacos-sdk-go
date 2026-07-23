@@ -140,6 +140,34 @@ func (mr *MockINamingClientMockRecorder) Subscribe(param interface{}) *gomock.Ca
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "Subscribe", reflect.TypeOf((*MockINamingClient)(nil).Subscribe), param)
 }
 
+// FuzzyWatch mocks base method
+func (m *MockINamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "FuzzyWatch", param)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// FuzzyWatch indicates an expected call of FuzzyWatch
+func (mr *MockINamingClientMockRecorder) FuzzyWatch(param interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FuzzyWatch", reflect.TypeOf((*MockINamingClient)(nil).FuzzyWatch), param)
+}
+
+// CancelFuzzyWatch mocks base method
+func (m *MockINamingClient) CancelFuzzyWatch(param *vo.FuzzyWatchParam) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CancelFuzzyWatch", param)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// CancelFuzzyWatch indicates an expected call of CancelFuzzyWatch
+func (mr *MockINamingClientMockRecorder) CancelFuzzyWatch(param interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelFuzzyWatch", reflect.TypeOf((*MockINamingClient)(nil).CancelFuzzyWatch), param)
+}
+
 // Unsubscribe mocks base method
 func (m *MockINamingClient) Unsubscribe(param *vo.SubscribeParam) error {
 	m.ctrl.T.Helper()

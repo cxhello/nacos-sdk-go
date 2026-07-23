@@ -49,6 +49,20 @@ func (mr *MockINamingProxyMockRecorder) BatchRegisterInstance(serviceName, group
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "BatchRegisterInstance", reflect.TypeOf((*MockINamingProxy)(nil).BatchRegisterInstance), serviceName, groupName, instances)
 }
 
+// CancelFuzzyWatch mocks base method.
+func (m *MockINamingProxy) CancelFuzzyWatch(groupKeyPattern string) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "CancelFuzzyWatch", groupKeyPattern)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// CancelFuzzyWatch indicates an expected call of CancelFuzzyWatch.
+func (mr *MockINamingProxyMockRecorder) CancelFuzzyWatch(groupKeyPattern interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelFuzzyWatch", reflect.TypeOf((*MockINamingProxy)(nil).CancelFuzzyWatch), groupKeyPattern)
+}
+
 // CloseClient mocks base method.
 func (m *MockINamingProxy) CloseClient() {
 	m.ctrl.T.Helper()
@@ -59,6 +73,20 @@ func (m *MockINamingProxy) CloseClient() {
 func (mr *MockINamingProxyMockRecorder) CloseClient() *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CloseClient", reflect.TypeOf((*MockINamingProxy)(nil).CloseClient))
+}
+
+// FuzzyWatch mocks base method.
+func (m *MockINamingProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
+	m.ctrl.T.Helper()
+	ret := m.ctrl.Call(m, "FuzzyWatch", groupKeyPattern, receivedGroupKeys, isInitializing)
+	ret0, _ := ret[0].(error)
+	return ret0
+}
+
+// FuzzyWatch indicates an expected call of FuzzyWatch.
+func (mr *MockINamingProxyMockRecorder) FuzzyWatch(groupKeyPattern, receivedGroupKeys, isInitializing interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FuzzyWatch", reflect.TypeOf((*MockINamingProxy)(nil).FuzzyWatch), groupKeyPattern, receivedGroupKeys, isInitializing)
 }
 
 // DeregisterInstance mocks base method.

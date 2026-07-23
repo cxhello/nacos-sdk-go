@@ -78,6 +78,14 @@ func (m *MockNamingProxy) Unsubscribe(serviceName, groupName, clusters string) e
 	return m.unsubscribeErr
 }
 
+func (m *MockNamingProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
+	return nil
+}
+
+func (m *MockNamingProxy) CancelFuzzyWatch(groupKeyPattern string) error {
+	return nil
+}
+
 func (m *MockNamingProxy) CloseClient() {}
 
 func NewTestNamingClient() *NamingClient {
@@ -694,4 +702,39 @@ func TestNamingClient_Unsubscribe_RestoresCallbackOnProxyFailure(t *testing.T) {
 	assert.True(t, mockProxy.unsubscribeCalled)
 	assert.True(t, client.serviceInfoHolder.IsSubscribed(util.GetGroupName("svc-restore", "g"), ""),
 		"callback must be restored when the server-side unsubscribe fails")
+}
+
+func TestFuzzyWatch_EmptyServiceNamePattern(t *testing.T) {
+	err := NewTestNamingClient().FuzzyWatch(&vo.FuzzyWatchParam{
+		WatchCallback: func(model.FuzzyWatchChangeEvent) {},
+	})
+	assert.Error(t, err)
+}
+
+func TestFuzzyWatch_NilCallback(t *testing.T) {
+	err := NewTestNamingClient().FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+	})
+	assert.Error(t, err)
+}
+
+func TestFuzzyWatch_Success(t *testing.T) {
+	err := NewTestNamingClient().FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	})
+	assert.NoError(t, err)
+}
+
+func TestCancelFuzzyWatch_LastCallbackTearsDown(t *testing.T) {
+	client := NewTestNamingClient()
+	cb := func(model.FuzzyWatchChangeEvent) {}
+	param := &vo.FuzzyWatchParam{ServiceNamePattern: "order*", WatchCallback: cb}
+	assert.NoError(t, client.FuzzyWatch(param))
+	// registering was recorded in the holder
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern)
+	// cancel removes the pattern once the last callback is gone
+	assert.NoError(t, client.CancelFuzzyWatch(param))
+	assert.NotContains(t, client.fuzzyWatchHolder.Patterns(), pattern)
 }
