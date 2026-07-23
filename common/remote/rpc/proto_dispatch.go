@@ -21,6 +21,7 @@ import (
 
 	nacos_grpc_service "github.com/nacos-group/nacos-sdk-proto/go"
 	"github.com/nacos-group/nacos-sdk-proto/go/common"
+	"github.com/nacos-group/nacos-sdk-proto/go/naming"
 	"github.com/pkg/errors"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
@@ -43,7 +44,9 @@ import (
 // cause.
 func decodeProtoResponse(payload *nacos_grpc_service.Payload) (rpc_response.IResponse, bool, error) {
 	switch payload.GetMetadata().GetType() {
-	case "HealthCheckResponse", "ServerCheckResponse", "ErrorResponse":
+	case "HealthCheckResponse", "ServerCheckResponse", "ErrorResponse",
+		"InstanceResponse", "BatchInstanceResponse", "QueryServiceResponse",
+		"SubscribeServiceResponse", "ServiceListResponse":
 	default:
 		return nil, false, nil
 	}
@@ -65,6 +68,26 @@ func decodeProtoResponse(payload *nacos_grpc_service.Payload) (rpc_response.IRes
 	case *common.ErrorResponse:
 		return &rpc_response.ErrorResponse{
 			Response: adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body),
+		}, true, nil
+	case *naming.InstanceResponse:
+		return &rpc_response.InstanceResponse{Response: adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body)}, true, nil
+	case *naming.BatchInstanceResponse:
+		return &rpc_response.BatchInstanceResponse{Response: adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body)}, true, nil
+	case *naming.QueryServiceResponse:
+		return &rpc_response.QueryServiceResponse{
+			Response:    adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body),
+			ServiceInfo: fromProtoServiceInfo(m.ServiceInfo),
+		}, true, nil
+	case *naming.SubscribeServiceResponse:
+		return &rpc_response.SubscribeServiceResponse{
+			Response:    adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body),
+			ServiceInfo: fromProtoServiceInfo(m.ServiceInfo),
+		}, true, nil
+	case *naming.ServiceListResponse:
+		return &rpc_response.ServiceListResponse{
+			Response:     adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body),
+			Count:        int(m.Count),
+			ServiceNames: m.ServiceNames,
 		}, true, nil
 	}
 	return nil, true, errors.Errorf("no proto adapter for migrated type %s", payload.GetMetadata().GetType())
