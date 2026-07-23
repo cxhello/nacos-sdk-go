@@ -197,3 +197,67 @@ func TestFromProtoInstanceHeartbeatSignPrefixedMetadataFallsBack(t *testing.T) {
 	assert.Equal(t, 5000, inst.InstanceHeartBeatInterval)
 	assert.Equal(t, 15000, inst.InstanceHeartBeatTimeOut)
 }
+
+func TestDecodeProtoNamingFuzzyWatchSyncRequest(t *testing.T) {
+	msg := &naming.NamingFuzzyWatchSyncRequest{
+		RequestId:       "10",
+		SyncType:        "FUZZY_WATCH_INIT_NOTIFY",
+		GroupKeyPattern: "public>>g*>>svc*",
+		Contexts: []*naming.NamingFuzzyWatchSyncRequestContext{
+			{ServiceKey: "public@@g@@svc1", ChangedType: "ADD_SERVICE"},
+			{ServiceKey: "public@@g@@svc2", ChangedType: "ADD_SERVICE"},
+		},
+		TotalBatch:   2,
+		CurrentBatch: 1,
+	}
+	payload, err := payloadCodec.Encode("NamingFuzzyWatchSyncRequest", msg, nil, "127.0.0.1")
+	require.NoError(t, err)
+
+	req, decoded := decodeProtoServerRequest(payload)
+	require.True(t, decoded)
+	s, ok := req.(*rpc_request.NamingFuzzyWatchSyncRequest)
+	require.True(t, ok)
+	assert.Equal(t, "10", s.RequestId)
+	assert.Equal(t, "FUZZY_WATCH_INIT_NOTIFY", s.SyncType)
+	assert.Equal(t, "public>>g*>>svc*", s.GroupKeyPattern)
+	assert.Equal(t, 2, s.TotalBatch)
+	assert.Equal(t, 1, s.CurrentBatch)
+	require.Len(t, s.Contexts, 2)
+	assert.Equal(t, "public@@g@@svc1", s.Contexts[0].ServiceKey)
+	assert.Equal(t, "ADD_SERVICE", s.Contexts[0].ChangedType)
+	assert.Equal(t, "public@@g@@svc2", s.Contexts[1].ServiceKey)
+}
+
+func TestDecodeProtoNamingFuzzyWatchChangeNotifyRequest(t *testing.T) {
+	msg := &naming.NamingFuzzyWatchChangeNotifyRequest{
+		RequestId:   "11",
+		SyncType:    "FUZZY_WATCH_RESOURCE_CHANGED",
+		ServiceKey:  "public@@g@@svc1",
+		ChangedType: "DELETE_SERVICE",
+	}
+	payload, err := payloadCodec.Encode("NamingFuzzyWatchChangeNotifyRequest", msg, nil, "127.0.0.1")
+	require.NoError(t, err)
+
+	req, decoded := decodeProtoServerRequest(payload)
+	require.True(t, decoded)
+	c, ok := req.(*rpc_request.NamingFuzzyWatchChangeNotifyRequest)
+	require.True(t, ok)
+	assert.Equal(t, "11", c.RequestId)
+	assert.Equal(t, "FUZZY_WATCH_RESOURCE_CHANGED", c.SyncType)
+	assert.Equal(t, "public@@g@@svc1", c.ServiceKey)
+	assert.Equal(t, "DELETE_SERVICE", c.ChangedType)
+}
+
+func TestDecodeProtoNamingFuzzyWatchResponse(t *testing.T) {
+	msg := &naming.NamingFuzzyWatchResponse{ResultCode: 200, RequestId: "12"}
+	payload, err := payloadCodec.Encode("NamingFuzzyWatchResponse", msg, nil, "127.0.0.1")
+	require.NoError(t, err)
+
+	resp, migrated, err := decodeProtoResponse(payload)
+	require.NoError(t, err)
+	require.True(t, migrated)
+	f, ok := resp.(*rpc_response.NamingFuzzyWatchResponse)
+	require.True(t, ok)
+	assert.True(t, f.IsSuccess())
+	assert.Equal(t, "12", f.RequestId)
+}
