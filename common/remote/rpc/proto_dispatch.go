@@ -124,7 +124,7 @@ func adaptBaseResponse(resultCode, errorCode int32, message, requestId string, b
 // wins over fail-fast here.
 func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.IRequest, bool) {
 	switch payload.GetMetadata().GetType() {
-	case "ConnectResetRequest", "ClientDetectionRequest":
+	case "ConnectResetRequest", "ClientDetectionRequest", "NotifySubscriberRequest":
 	default:
 		return nil, false
 	}
@@ -145,6 +145,13 @@ func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.
 		return req, true
 	case *common.ClientDetectionRequest:
 		req := &rpc_request.ClientDetectionRequest{InternalRequest: rpc_request.NewInternalRequest()}
+		req.RequestId = m.RequestId
+		return req, true
+	case *naming.NotifySubscriberRequest:
+		req := &rpc_request.NotifySubscriberRequest{
+			NamingRequest: rpc_request.NewNamingRequest(m.Namespace, m.ServiceName, m.GroupName),
+			ServiceInfo:   fromProtoServiceInfo(m.ServiceInfo),
+		}
 		req.RequestId = m.RequestId
 		return req, true
 	}

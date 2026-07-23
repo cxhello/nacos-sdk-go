@@ -23,6 +23,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 )
 
@@ -128,4 +129,25 @@ func TestDecodeProtoSubscribeServiceResponse(t *testing.T) {
 	assert.Equal(t, uint64(8001), s.ServiceInfo.Hosts[0].Port)
 	assert.True(t, s.ServiceInfo.Hosts[0].Enable)
 	assert.True(t, s.ServiceInfo.Valid)
+}
+
+func TestDecodeProtoNotifySubscriberRequest(t *testing.T) {
+	msg := &naming.NotifySubscriberRequest{
+		RequestId: "9", Namespace: "ns", ServiceName: "svc", GroupName: "g",
+		ServiceInfo: &naming.ServiceInfo{Name: "svc", GroupName: "g", LastRefTime: 123,
+			Hosts: []*naming.Instance{{Ip: "1.2.3.4", Port: 80, Enabled: true}}},
+	}
+	payload, err := payloadCodec.Encode("NotifySubscriberRequest", msg, nil, "127.0.0.1")
+	require.NoError(t, err)
+
+	req, decoded := decodeProtoServerRequest(payload)
+	require.True(t, decoded)
+	n, ok := req.(*rpc_request.NotifySubscriberRequest)
+	require.True(t, ok)
+	assert.Equal(t, "9", n.RequestId)
+	assert.Equal(t, "ns", n.Namespace)
+	assert.Equal(t, "svc", n.ServiceInfo.Name)
+	assert.Equal(t, uint64(123), n.ServiceInfo.LastRefTime)
+	require.Len(t, n.ServiceInfo.Hosts, 1)
+	assert.True(t, n.ServiceInfo.Hosts[0].Enable)
 }
