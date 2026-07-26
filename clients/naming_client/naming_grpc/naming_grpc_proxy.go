@@ -265,6 +265,13 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 	proxy.eventListener.RemoveSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
 	_, err := proxy.send(rpc_request.NewSubscribeServiceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName,
 		clusters, false))
+	if err != nil {
+		// the server-side unsubscribe request failed, so the server keeps
+		// pushing updates for this subscription; restore the redo cache
+		// entry so a reconnect keeps re-subscribing until a later
+		// unsubscribe call actually succeeds.
+		proxy.eventListener.CacheSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
+	}
 	return err
 }
 

@@ -329,3 +329,21 @@ func TestConcurrentRegisterAndDeregisterDoesNotDeadlock(t *testing.T) {
 		t.Fatal("timed out waiting for concurrent register/deregister to finish - possible deadlock on redoMu")
 	}
 }
+
+// TestUnsubscribeRestoresRedoOnFailure verifies that when the server-side
+// unsubscribe request fails, the redo cache entry is restored so a later
+// reconnect keeps re-subscribing instead of silently dropping the
+// subscription (the server only stops pushing once an unsubscribe actually
+// succeeds).
+func TestUnsubscribeRestoresRedoOnFailure(t *testing.T) {
+	proxy, _ := newTestProxy()
+	proxy.eventListener.CacheSubscriberForRedo(util.GetGroupName("svc", "g"), "")
+	proxy.send = func(r rpc_request.IRequest) (rpc_response.IResponse, error) {
+		return nil, errors.New("boom")
+	}
+
+	err := proxy.Unsubscribe("svc", "g", "")
+
+	assert.Error(t, err)
+	assert.True(t, proxy.eventListener.IsSubscriberCached(util.GetServiceCacheKey(util.GetGroupName("svc", "g"), "")))
+}
