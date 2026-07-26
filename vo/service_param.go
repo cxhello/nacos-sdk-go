@@ -105,5 +105,5 @@ type SelectOneHealthInstanceParam struct {
 type FuzzyWatchParam struct {
 	ServiceNamePattern string                                  `param:"serviceNamePattern"` //required
 	GroupNamePattern   string                                  `param:"groupNamePattern"`   //optional,default:DEFAULT_GROUP
-	WatchCallback      func(event model.FuzzyWatchChangeEvent) //required
+	WatchCallback      func(event model.FuzzyWatchChangeEvent) //required for FuzzyWatch; ignored (may be nil) for CancelFuzzyWatch, which cancels the whole pattern
 }

@@ -114,15 +114,19 @@ type INamingClient interface {
 	//   match-all ("*"), prefix ("order*"), suffix ("*order"), contains ("*order*")
 	// GroupNamePattern optional,default:DEFAULT_GROUP
 	// WatchCallback require
+	// An error return means the watch was not established and the local
+	// registration was rolled back; however, on an already-watched pattern
+	// with existing matches, the callback may already have been invoked with
+	// initial replay events queued before the failure was known - the
+	// rollback only guarantees no event enqueued after it runs is delivered.
 	FuzzyWatch(param *vo.FuzzyWatchParam) error
 
-	// CancelFuzzyWatch use to cancel a fuzzy watch. It cancels the whole
-	// pattern - every callback registered for it, and the server-side watch -
-	// unconditionally; it is not yet scoped to just the given WatchCallback
-	// (Task 9 tracks per-callback teardown)
+	// CancelFuzzyWatch use to cancel a fuzzy watch. Cancellation is scoped to
+	// the whole pattern - every callback registered for it, and the
+	// server-side watch - not to param.WatchCallback, which is therefore not
+	// required and may be left nil.
 	// ServiceNamePattern require
 	// GroupNamePattern optional,default:DEFAULT_GROUP
-	// WatchCallback require
 	CancelFuzzyWatch(param *vo.FuzzyWatchParam) error
 
 	// GetAllServicesInfo use to get all service info by page

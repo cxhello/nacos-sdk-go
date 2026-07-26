@@ -345,20 +345,38 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 func (proxy *NamingGrpcProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
 	logger.Infof("fuzzy watch namespaceId:<%s>, pattern:<%s>, isInitializing:<%t>",
 		proxy.clientConfig.NamespaceId, groupKeyPattern, isInitializing)
-	proxy.eventListener.CacheFuzzyWatchForRedo(groupKeyPattern)
 	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
 		constant.FUZZY_WATCH_TYPE_WATCH, receivedGroupKeys, isInitializing)
-	return proxy.sendFuzzyWatch(request, groupKeyPattern)
+	if err := proxy.sendFuzzyWatch(request, groupKeyPattern); err != nil {
+		return err
+	}
+	// Cache for redo only once the server has actually accepted the watch:
+	// caching before send would leave a stale redo entry - and a reconnect
+	// that resubscribes a pattern the server never agreed to watch - behind a
+	// failed RPC. Accepted trade-off: if the connection dies while the send
+	// is in flight (accepted server-side but the reply never arrives, or lost
+	// mid-transit), the pattern is not yet in the redo cache, so a reconnect
+	// in that window will not re-watch it until the caller retries - this
+	// leaves no residue on failure, at the cost of not auto-recovering that
+	// narrow race.
+	proxy.eventListener.CacheFuzzyWatchForRedo(groupKeyPattern)
+	return nil
 }
 
 // CancelFuzzyWatch tears down a fuzzy watch on groupKeyPattern (watchType
 // CANCEL_WATCH) and removes it from the redo cache.
 func (proxy *NamingGrpcProxy) CancelFuzzyWatch(groupKeyPattern string) error {
 	logger.Infof("cancel fuzzy watch namespaceId:<%s>, pattern:<%s>", proxy.clientConfig.NamespaceId, groupKeyPattern)
-	proxy.eventListener.RemoveFuzzyWatchForRedo(groupKeyPattern)
 	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
 		constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, nil, false)
-	return proxy.sendFuzzyWatch(request, groupKeyPattern)
+	if err := proxy.sendFuzzyWatch(request, groupKeyPattern); err != nil {
+		return err
+	}
+	// Only drop the redo entry once the server has confirmed the cancel: if
+	// the RPC failed the server still thinks the watch is active, so a
+	// reconnect must keep re-registering it rather than silently dropping it.
+	proxy.eventListener.RemoveFuzzyWatchForRedo(groupKeyPattern)
+	return nil
 }
 
 // sendFuzzyWatch sends a fuzzy watch request and surfaces a non-success server

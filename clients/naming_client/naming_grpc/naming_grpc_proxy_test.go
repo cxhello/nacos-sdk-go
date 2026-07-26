@@ -460,6 +460,41 @@ func TestCancelFuzzyWatchSendsCancel(t *testing.T) {
 	assert.False(t, proxy.eventListener.fuzzyWatchPatterns.Has("public>>DEFAULT_GROUP>>order*"))
 }
 
+// TestFuzzyWatchDoesNotCacheRedoOnFailure is a regression test: caching a
+// pattern for redo before the server has actually accepted the watch would
+// leave a stale redo entry behind a failed RPC, causing a later reconnect to
+// resubscribe a pattern the server never agreed to watch.
+func TestFuzzyWatchDoesNotCacheRedoOnFailure(t *testing.T) {
+	proxy, _ := newTestProxy()
+	proxy.send = func(r rpc_request.IRequest) (rpc_response.IResponse, error) {
+		return nil, errors.New("boom")
+	}
+
+	err := proxy.FuzzyWatch("public>>DEFAULT_GROUP>>order*", nil, true)
+
+	assert.Error(t, err)
+	assert.False(t, proxy.eventListener.fuzzyWatchPatterns.Has("public>>DEFAULT_GROUP>>order*"),
+		"a failed FuzzyWatch RPC must not leave a stale redo cache entry")
+}
+
+// TestCancelFuzzyWatchKeepsRedoCacheOnFailure is a regression test: dropping
+// the redo entry before the server has confirmed the cancel would leave a
+// watch the server still thinks is active unrestored after a reconnect.
+func TestCancelFuzzyWatchKeepsRedoCacheOnFailure(t *testing.T) {
+	proxy, sent := newTestProxy()
+	require.NoError(t, proxy.FuzzyWatch("public>>DEFAULT_GROUP>>order*", nil, true))
+	*sent = nil
+	proxy.send = func(r rpc_request.IRequest) (rpc_response.IResponse, error) {
+		return nil, errors.New("boom")
+	}
+
+	err := proxy.CancelFuzzyWatch("public>>DEFAULT_GROUP>>order*")
+
+	assert.Error(t, err)
+	assert.True(t, proxy.eventListener.fuzzyWatchPatterns.Has("public>>DEFAULT_GROUP>>order*"),
+		"a failed CancelFuzzyWatch RPC must keep the redo cache entry so a reconnect keeps the watch alive")
+}
+
 func TestRedoResendsFuzzyWatchWithReceivedKeys(t *testing.T) {
 	proxy, sent := newTestProxy()
 	holder := naming_cache.NewFuzzyWatchServiceListHolder("public")

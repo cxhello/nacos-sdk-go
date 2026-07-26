@@ -388,6 +388,82 @@ func TestRegisterPatternAppendsDuplicates(t *testing.T) {
 	waitForEvents(t, sink, 2, "duplicate registration is not deduped; the event is delivered once per registration")
 }
 
+// TestSecondWatcherReplaysExistingKeys is a regression test for Java parity
+// (NamingFuzzyWatchServiceListHolder#registerFuzzyWatcher): a watcher that
+// registers on a pattern *after* it has already synced some matches must be
+// replayed those matches immediately, as if it had been there from the
+// start, instead of only learning about them on the next server push. The
+// replay must target only the newly registered callback - the first watcher
+// already has these events and must not see them again.
+func TestSecondWatcherReplaysExistingKeys(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	firstSink := &eventSink{}
+	holder.RegisterPattern(testPattern, firstSink.cb)
+
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+		syncCtx("public@@DEFAULT_GROUP@@order-b", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+	}, 1, 1)
+	waitForEvents(t, firstSink, 2, "first watcher gets the initial batch")
+
+	secondSink := &eventSink{}
+	_, created := holder.RegisterPattern(testPattern, secondSink.cb)
+	assert.False(t, created, "pattern context already exists")
+
+	waitForEvents(t, secondSink, 2, "late-joining watcher is replayed the existing matched services")
+	events := secondSink.snapshot()
+	names := []string{events[0].ServiceName, events[1].ServiceName}
+	sort.Strings(names)
+	assert.Equal(t, []string{"order-a", "order-b"}, names)
+	for _, e := range events {
+		assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, e.ChangedType, "replay is always modeled as an ADD")
+		assert.Equal(t, constant.FUZZY_WATCH_INIT_NOTIFY, e.SyncType, "replay carries INIT_NOTIFY sync type, matching Java")
+	}
+
+	// The pre-existing watcher must not be replayed again: settle briefly and
+	// re-check its count is still exactly 2 (waitForEvents above only proves
+	// the *second* sink reached 2 at some instant; it says nothing about a
+	// spurious 3rd event landing on firstSink a moment later).
+	time.Sleep(75 * time.Millisecond)
+	assert.Equal(t, 2, firstSink.len(), "existing watcher must not receive a duplicate replay")
+}
+
+// TestSyncTypePropagatedOnHandleSync is a regression test for exposing the
+// server's own syncType on the public event: callers otherwise cannot tell an
+// initial batch sync apart from a later diff sync.
+func TestSyncTypePropagatedOnHandleSync(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	sink := &eventSink{}
+	holder.RegisterPattern(testPattern, sink.cb)
+
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+	}, 1, 1)
+	waitForEvents(t, sink, 1)
+	assert.Equal(t, constant.FUZZY_WATCH_INIT_NOTIFY, sink.snapshot()[0].SyncType)
+
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-b", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+	}, 1, 1)
+	waitForEvents(t, sink, 2)
+	assert.Equal(t, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, sink.snapshot()[1].SyncType)
+}
+
+// TestSyncTypeIsResourceChangedOnChangeNotify is a regression test asserting
+// that a post-init change-notify event always carries
+// constant.FUZZY_WATCH_RESOURCE_CHANGED, distinguishing it from a batch sync
+// event even though both fire through the same callback.
+func TestSyncTypeIsResourceChangedOnChangeNotify(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	sink := &eventSink{}
+	holder.RegisterPattern(testPattern, sink.cb)
+
+	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+
+	waitForEvents(t, sink, 1)
+	assert.Equal(t, constant.FUZZY_WATCH_RESOURCE_CHANGED, sink.snapshot()[0].SyncType)
+}
+
 func TestHolderRemoveCallbackByIDAndPattern(t *testing.T) {
 	holder := NewFuzzyWatchServiceListHolder("public")
 	var aCount, bCount int

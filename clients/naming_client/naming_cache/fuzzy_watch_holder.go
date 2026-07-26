@@ -122,8 +122,10 @@ func (c *fuzzyWatchContext) drain() {
 // applyChange mutates receivedGroupKeys for a single serviceKey and reports
 // the event to fire, if any. Called with c.mu held. An ADD for a key already
 // known, or a DELETE for a key not known, is a no-op that fires nothing -
-// this is what makes redo/duplicate syncs idempotent.
-func (c *fuzzyWatchContext) applyChange(serviceKey, namespace, group, service, changedType string) (model.FuzzyWatchChangeEvent, bool) {
+// this is what makes redo/duplicate syncs idempotent. syncType is copied
+// verbatim onto the returned event so a callback can distinguish an initial
+// batch sync from a post-init change notify.
+func (c *fuzzyWatchContext) applyChange(serviceKey, namespace, group, service, changedType, syncType string) (model.FuzzyWatchChangeEvent, bool) {
 	switch changedType {
 	case constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE:
 		if _, ok := c.receivedGroupKeys[serviceKey]; ok {
@@ -144,6 +146,7 @@ func (c *fuzzyWatchContext) applyChange(serviceKey, namespace, group, service, c
 		GroupName:   group,
 		NamespaceId: namespace,
 		ChangedType: changedType,
+		SyncType:    syncType,
 	}, true
 }
 
@@ -192,6 +195,12 @@ func (h *FuzzyWatchServiceListHolder) get(pattern string) (*fuzzyWatchContext, b
 // Callers that must avoid duplicate delivery are responsible for tracking
 // the returned id and not registering twice.
 //
+// If pattern already has known matched services (created is false and the
+// pattern's initial sync has already delivered some), the new callback alone
+// is replayed those services as ADD_SERVICE events before this call returns
+// - see the replay block below. Every other, already-registered callback on
+// the same pattern is unaffected.
+//
 // h.mu is held across both the pattern lookup/create and the callback
 // append below, nesting ctx.mu inside it, so a concurrent RemovePattern can
 // never evict the context between "found/created it" and "appended the
@@ -216,6 +225,29 @@ func (h *FuzzyWatchServiceListHolder) RegisterPattern(pattern string, cb func(mo
 	id = h.nextCallbackID.Add(1)
 	ctx.mu.Lock()
 	ctx.callbacks = append(ctx.callbacks, registeredCallback{id: id, fn: cb})
+
+	// Java parity (NamingFuzzyWatchServiceListHolder#registerFuzzyWatcher):
+	// replay the currently known matched services to the NEW watcher only, as
+	// ADD_SERVICE events with FUZZY_WATCH_INIT_NOTIFY sync type, so a
+	// late-joining watcher on an already-synced pattern still learns the
+	// existing match set instead of waiting for the next server push. For a
+	// brand-new pattern receivedGroupKeys is empty, so this is a no-op.
+	replay := make([]notifyTask, 0, len(ctx.receivedGroupKeys))
+	for serviceKey := range ctx.receivedGroupKeys {
+		namespace, group, service, err := parseServiceKey(serviceKey)
+		if err != nil {
+			continue
+		}
+		replay = append(replay, notifyTask{
+			event: model.FuzzyWatchChangeEvent{
+				ServiceName: service, GroupName: group, NamespaceId: namespace,
+				ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE,
+				SyncType:    constant.FUZZY_WATCH_INIT_NOTIFY,
+			},
+			callbacks: []func(model.FuzzyWatchChangeEvent){cb},
+		})
+	}
+	ctx.enqueueLocked(replay...)
 	ctx.mu.Unlock()
 	return id, created
 }
@@ -248,6 +280,37 @@ func (h *FuzzyWatchServiceListHolder) RemoveCallbackByID(pattern string, id uint
 		}
 	}
 	ctx.callbacks = kept
+}
+
+// RemovePatternIfEmpty removes pattern only if it currently has no
+// registered callbacks. It mirrors Java
+// NamingFuzzyWatchServiceListHolder#removePatternMatchCache's
+// watchers.isEmpty() gate, and exists for naming_client's registration
+// rollback path: a caller whose own FuzzyWatch RPC failed must undo its own
+// registration but can never be allowed to tear down a pattern that a
+// concurrent, successful FuzzyWatch call already populated with its own
+// callback while this caller's RPC was still in flight - unconditionally
+// calling RemovePattern here would wipe that other caller's callback and
+// receivedGroupKeys, leaving a server-side watch with no local pattern to
+// match pushes against.
+//
+// Lock order is h.mu -> ctx.mu, same as RegisterPattern (see the comment
+// there): h.mu is held across the lookup and the ctx.mu-guarded emptiness
+// check, so a concurrent RegisterPattern cannot append a callback to ctx
+// between this check and the removal.
+func (h *FuzzyWatchServiceListHolder) RemovePatternIfEmpty(pattern string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	ctx, ok := h.get(pattern)
+	if !ok {
+		return
+	}
+	ctx.mu.Lock()
+	empty := len(ctx.callbacks) == 0
+	ctx.mu.Unlock()
+	if empty {
+		h.patterns.Remove(pattern)
+	}
 }
 
 // RemovePattern forgets a pattern entirely (its keys and callbacks). This
@@ -319,7 +382,7 @@ func (h *FuzzyWatchServiceListHolder) HandleSync(pattern, syncType string, conte
 			logger.Warnf("fuzzy watch skips malformed serviceKey:%s changedType:%s err:%v", item.ServiceKey, item.ChangedType, err)
 			continue
 		}
-		if ev, ok := ctx.applyChange(item.ServiceKey, namespace, group, service, item.ChangedType); ok {
+		if ev, ok := ctx.applyChange(item.ServiceKey, namespace, group, service, item.ChangedType, syncType); ok {
 			events = append(events, ev)
 		}
 	}
@@ -353,7 +416,7 @@ func (h *FuzzyWatchServiceListHolder) HandleChangeNotify(serviceKey, changedType
 			continue
 		}
 		ctx.mu.Lock()
-		if ev, fired := ctx.applyChange(serviceKey, namespace, group, service, changedType); fired {
+		if ev, fired := ctx.applyChange(serviceKey, namespace, group, service, changedType, constant.FUZZY_WATCH_RESOURCE_CHANGED); fired {
 			ctx.enqueueLocked(notifyTask{event: ev, callbacks: ctx.snapshotCallbacks()})
 		}
 		ctx.mu.Unlock()

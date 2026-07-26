@@ -19,10 +19,15 @@ package model
 // FuzzyWatchChangeEvent is delivered to a FuzzyWatch callback whenever a
 // service matching the watched pattern is added or deleted. ChangedType is
 // one of constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE /
-// FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE.
+// FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE. SyncType identifies which server
+// push produced the event: constant.FUZZY_WATCH_INIT_NOTIFY /
+// FUZZY_WATCH_DIFF_SYNC_NOTIFY for a batch sync (also used for the local
+// replay a late-joining watcher receives for already-known matches),
+// or constant.FUZZY_WATCH_RESOURCE_CHANGED for a post-init change notify.
 type FuzzyWatchChangeEvent struct {
 	ServiceName string
 	GroupName   string
 	NamespaceId string
 	ChangedType string
+	SyncType    string
 }

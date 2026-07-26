@@ -18,16 +18,20 @@ package naming_client
 
 import (
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/nacos_client"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var clientConfigTest = *constant.NewClientConfig(
@@ -39,9 +43,38 @@ var clientConfigTest = *constant.NewClientConfig(
 var serverConfigTest = *constant.NewServerConfig("127.0.0.1", 80, constant.WithContextPath("/nacos"))
 
 type MockNamingProxy struct {
+	// mu guards every field below. Most tests drive the mock from a single
+	// goroutine, but the C1 regression test
+	// (TestFuzzyWatchRollbackNeverDropsConcurrentRegistration) deliberately
+	// runs two FuzzyWatch calls concurrently, so the recorder slices and the
+	// result-selection fields must be safe for concurrent read/write - `go
+	// test -race` catches any field touched without this lock.
+	mu sync.Mutex
+
 	unsubscribeCalled bool
 	unsubscribeParams []string // 记录调用参数
 	unsubscribeErr    error    // 注入 Unsubscribe 失败
+
+	// fuzzyWatchErr/cancelFuzzyWatchErr let tests simulate a failing
+	// server-side RPC to exercise the client's rollback/keep-state paths.
+	fuzzyWatchErr         error
+	cancelFuzzyWatchErr   error
+	fuzzyWatchCalls       []fuzzyWatchCall
+	cancelFuzzyWatchCalls []string
+
+	// fuzzyWatchResultFn, if set, computes the FuzzyWatch return value for
+	// each call from (pattern, isInitializing) instead of the static
+	// fuzzyWatchErr above, and is free to block before returning. Tests use
+	// it to pause one call mid-RPC so a second, concurrent FuzzyWatch call
+	// can be driven to completion first, deterministically reproducing the
+	// window between RegisterPattern succeeding locally and the RPC outcome
+	// becoming known that the C1 rollback race depends on.
+	fuzzyWatchResultFn func(pattern string, isInitializing bool) error
+}
+
+type fuzzyWatchCall struct {
+	pattern        string
+	isInitializing bool
 }
 
 func (m *MockNamingProxy) RegisterInstance(serviceName string, groupName string, instance model.Instance) (bool, error) {
@@ -73,17 +106,45 @@ func (m *MockNamingProxy) Subscribe(serviceName, groupName, clusters string) (mo
 }
 
 func (m *MockNamingProxy) Unsubscribe(serviceName, groupName, clusters string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.unsubscribeCalled = true
 	m.unsubscribeParams = []string{serviceName, groupName, clusters}
 	return m.unsubscribeErr
 }
 
+// FuzzyWatch records the call and returns fuzzyWatchResultFn's verdict if
+// set, else the static fuzzyWatchErr. fuzzyWatchResultFn (when set) is
+// invoked WITHOUT the lock held, so it may itself block (e.g. on a channel)
+// without deadlocking a concurrent call into this same mock.
 func (m *MockNamingProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
-	return nil
+	m.mu.Lock()
+	m.fuzzyWatchCalls = append(m.fuzzyWatchCalls, fuzzyWatchCall{pattern: groupKeyPattern, isInitializing: isInitializing})
+	resultFn := m.fuzzyWatchResultFn
+	staticErr := m.fuzzyWatchErr
+	m.mu.Unlock()
+
+	if resultFn != nil {
+		return resultFn(groupKeyPattern, isInitializing)
+	}
+	return staticErr
+}
+
+// fuzzyWatchCallsSnapshot returns a race-safe copy of the recorded FuzzyWatch
+// calls, for tests that assert on call order/content after concurrent calls.
+func (m *MockNamingProxy) fuzzyWatchCallsSnapshot() []fuzzyWatchCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]fuzzyWatchCall, len(m.fuzzyWatchCalls))
+	copy(out, m.fuzzyWatchCalls)
+	return out
 }
 
 func (m *MockNamingProxy) CancelFuzzyWatch(groupKeyPattern string) error {
-	return nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cancelFuzzyWatchCalls = append(m.cancelFuzzyWatchCalls, groupKeyPattern)
+	return m.cancelFuzzyWatchErr
 }
 
 func (m *MockNamingProxy) CloseClient() {}
@@ -726,15 +787,304 @@ func TestFuzzyWatch_Success(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestCancelFuzzyWatch_LastCallbackTearsDown(t *testing.T) {
+// TestFuzzyWatchRollsBackOnServerFailure_NewPattern is a regression test:
+// when FuzzyWatch is the first registration for a pattern and the
+// server-side RPC fails, the just-created pattern context must be removed
+// entirely rather than left behind as a local registration that will never
+// receive a server push.
+func TestFuzzyWatchRollsBackOnServerFailure_NewPattern(t *testing.T) {
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+	mockProxy.fuzzyWatchErr = errors.New("boom")
+
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+	err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	})
+
+	assert.Error(t, err)
+	assert.NotContains(t, client.fuzzyWatchHolder.Patterns(), pattern,
+		"a failed registration on a brand-new pattern must not leave it behind")
+}
+
+// TestFuzzyWatchRollsBackOnServerFailure_ExistingPattern is a regression
+// test: a second watcher registering on an already-registered pattern whose
+// own FuzzyWatch RPC fails must roll back only its own callback, leaving the
+// pattern and the first watcher's registration untouched. The pattern here
+// has no received keys yet, so RegisterPattern's replay block is a no-op and
+// the rolled-back callback can be asserted to never fire at all - see
+// TestFuzzyWatchRollsBackOnServerFailure_ExistingPatternWithReceivedKeys for
+// the case where that assertion would not be honest.
+func TestFuzzyWatchRollsBackOnServerFailure_ExistingPattern(t *testing.T) {
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+	firstFired := make(chan struct{}, 1)
+	require.NoError(t, client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback: func(model.FuzzyWatchChangeEvent) {
+			select {
+			case firstFired <- struct{}{}:
+			default:
+			}
+		},
+	}))
+
+	mockProxy.fuzzyWatchErr = errors.New("boom")
+	var secondMu sync.Mutex
+	secondCalled := false
+	err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback: func(model.FuzzyWatchChangeEvent) {
+			secondMu.Lock()
+			secondCalled = true
+			secondMu.Unlock()
+		},
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern,
+		"the pre-existing pattern must survive a second watcher's failed registration")
+
+	// The first watcher's call created the pattern (isInitializing=true);
+	// the second, on the already-created pattern, must ask for a diff only
+	// (isInitializing=false).
+	calls := mockProxy.fuzzyWatchCallsSnapshot()
+	require.Len(t, calls, 2)
+	assert.True(t, calls[0].isInitializing, "first watcher on a new pattern must send isInitializing=true")
+	assert.False(t, calls[1].isInitializing, "second watcher on an already-created pattern must send isInitializing=false")
+
+	// The rolled-back callback must actually be gone, not just the pattern
+	// left in place: fire a change-notify and wait for proof the dispatcher
+	// processed it (the surviving watcher's callback firing) before checking
+	// that the rolled-back callback never ran.
+	client.fuzzyWatchHolder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	select {
+	case <-firstFired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("surviving watcher's callback never fired")
+	}
+	secondMu.Lock()
+	defer secondMu.Unlock()
+	assert.False(t, secondCalled, "the rolled-back callback must never fire (this pattern has no received keys, so no replay is possible)")
+}
+
+// TestFuzzyWatchRollsBackOnServerFailure_ExistingPatternWithReceivedKeys is a
+// regression test for I1: RegisterPattern enqueues the initial replay of a
+// pattern's already-known matched services BEFORE the server RPC outcome is
+// known, so RemoveCallbackByID's rollback cannot recall a replay task the
+// async dispatcher already snapshotted into its queue. A caller whose
+// FuzzyWatch fails on an already-synced, non-empty pattern may therefore
+// still observe that replay reach its callback. This test asserts the
+// honest contract: the local registration is rolled back and the pattern
+// survives, replay delivery is deliberately NOT asserted either way (it may
+// or may not have landed), but nothing enqueued AFTER the rollback runs ever
+// reaches the rolled-back callback.
+func TestFuzzyWatchRollsBackOnServerFailure_ExistingPatternWithReceivedKeys(t *testing.T) {
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+
+	var firstMu sync.Mutex
+	var firstEvents []model.FuzzyWatchChangeEvent
+	require.NoError(t, client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback: func(ev model.FuzzyWatchChangeEvent) {
+			firstMu.Lock()
+			firstEvents = append(firstEvents, ev)
+			firstMu.Unlock()
+		},
+	}))
+
+	// Seed the pattern with an existing matched service via a server-pushed
+	// INIT sync, so the pattern is non-empty before the second watcher
+	// registers - this is what makes RegisterPattern's replay block fire for
+	// the second callback below.
+	client.fuzzyWatchHolder.HandleSync(pattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		{ServiceKey: "public@@DEFAULT_GROUP@@order-seed", ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE},
+	}, 1, 1)
+	client.fuzzyWatchHolder.HandleSync(pattern, constant.FINISH_FUZZY_WATCH_INIT_NOTIFY, nil, 1, 1)
+
+	mockProxy.fuzzyWatchErr = errors.New("boom")
+	var secondMu sync.Mutex
+	var secondEvents []model.FuzzyWatchChangeEvent
+	err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback: func(ev model.FuzzyWatchChangeEvent) {
+			secondMu.Lock()
+			secondEvents = append(secondEvents, ev)
+			secondMu.Unlock()
+		},
+	})
+
+	assert.Error(t, err)
+	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern,
+		"the pre-existing pattern must survive a second watcher's failed registration")
+
+	// Prove dispatch still works and the rollback took effect, using an
+	// event injected strictly AFTER the rollback with a service name that
+	// appears nowhere in the pre-existing replay - a hit on it can only come
+	// from post-rollback dispatch, never from racy replay delivery, so this
+	// assertion is deterministic even though replay delivery itself is not.
+	client.fuzzyWatchHolder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-post-rollback", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	require.Eventually(t, func() bool {
+		firstMu.Lock()
+		defer firstMu.Unlock()
+		for _, ev := range firstEvents {
+			if ev.ServiceName == "order-post-rollback" {
+				return true
+			}
+		}
+		return false
+	}, 2*time.Second, 10*time.Millisecond, "surviving watcher's callback never received the post-rollback event")
+
+	secondMu.Lock()
+	defer secondMu.Unlock()
+	for _, ev := range secondEvents {
+		assert.NotEqual(t, "order-post-rollback", ev.ServiceName,
+			"the rolled-back callback must never receive an event enqueued after its rollback")
+	}
+	// Replay delivery of "order-seed" (enqueued before the rollback ran) is
+	// deliberately not asserted either way: it is a queued task the rollback
+	// cannot recall - see the fuzzyWatchContext dispatcher comment in
+	// fuzzy_watch_holder.go - so whether it reached the rolled-back callback
+	// is inherently racy, and asserting its absence would be dishonest.
+}
+
+// TestFuzzyWatchRollbackNeverDropsConcurrentRegistration is a C1 regression
+// test: naming_client.FuzzyWatch's failure-path rollback must never remove a
+// pattern that a DIFFERENT, concurrently successful FuzzyWatch call already
+// populated with its own callback. The old rollback branched on `created` (a
+// snapshot taken before the RPC): if goroutine A's call created the pattern
+// and then its RPC failed, it unconditionally called RemovePattern even
+// though goroutine B's call on the same pattern may have succeeded and
+// registered its own callback while A's RPC was still in flight - wiping B's
+// callback and receivedGroupKeys and leaving a server-side watch with no
+// matching local pattern. This test forces that exact interleaving with a
+// channel-gated mock FuzzyWatch call so the race is deterministic rather
+// than timing-dependent.
+func TestFuzzyWatchRollbackNeverDropsConcurrentRegistration(t *testing.T) {
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+
+	aEntered := make(chan struct{})
+	aRelease := make(chan struct{})
+
+	mockProxy.mu.Lock()
+	mockProxy.fuzzyWatchResultFn = func(p string, isInitializing bool) error {
+		if p == pattern && isInitializing {
+			// This is goroutine A's call (the first watcher, creating the
+			// pattern): signal that it has entered the RPC so the test can
+			// safely drive B to completion, then block until told to
+			// proceed, simulating an RPC that fails slowly.
+			close(aEntered)
+			<-aRelease
+			return errors.New("boom")
+		}
+		// Any other call (B's, on the pattern A already created locally)
+		// succeeds immediately.
+		return nil
+	}
+	mockProxy.mu.Unlock()
+
+	var aErr error
+	aDone := make(chan struct{})
+	go func() {
+		defer close(aDone)
+		aErr = client.FuzzyWatch(&vo.FuzzyWatchParam{
+			ServiceNamePattern: "order*",
+			WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+		})
+	}()
+
+	select {
+	case <-aEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine A never entered its FuzzyWatch RPC")
+	}
+
+	bFired := make(chan struct{}, 1)
+	require.NoError(t, client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback: func(model.FuzzyWatchChangeEvent) {
+			select {
+			case bFired <- struct{}{}:
+			default:
+			}
+		},
+	}), "goroutine B's concurrent watch on the same pattern must succeed while A is still in flight")
+
+	close(aRelease)
+	select {
+	case <-aDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("goroutine A's FuzzyWatch call never returned")
+	}
+	assert.Error(t, aErr, "goroutine A's own RPC failure must still be reported to it")
+
+	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern,
+		"A's rollback must not remove the pattern B is concurrently, successfully watching")
+
+	// Confirm B's registration is still functionally alive, not just present
+	// in the pattern map: a server push after the race must still reach it.
+	client.fuzzyWatchHolder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	select {
+	case <-bFired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("B's callback never received a subsequent HandleChangeNotify event")
+	}
+}
+
+// TestCancelFuzzyWatchKeepsStateOnServerFailure is a regression test: if the
+// server-side cancel RPC fails, local state (the pattern and its callbacks)
+// must be left exactly as it was - the server still thinks the watch is
+// active, so tearing down local state early would silently stop delivering
+// events the server keeps pushing.
+func TestCancelFuzzyWatchKeepsStateOnServerFailure(t *testing.T) {
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+	cb := func(model.FuzzyWatchChangeEvent) {}
+	param := &vo.FuzzyWatchParam{ServiceNamePattern: "order*", WatchCallback: cb}
+	require.NoError(t, client.FuzzyWatch(param))
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+
+	mockProxy.cancelFuzzyWatchErr = errors.New("boom")
+	err := client.CancelFuzzyWatch(param)
+
+	assert.Error(t, err)
+	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern,
+		"a failed cancel RPC must keep the pattern's local state intact")
+}
+
+// TestCancelFuzzyWatchTearsDownOnSuccess replaces the former
+// TestCancelFuzzyWatch_LastCallbackTearsDown, whose name overstated the
+// mechanism: cancellation is pattern-scoped, not gated on "last callback"
+// bookkeeping - a successful cancel RPC always tears down the whole pattern.
+func TestCancelFuzzyWatchTearsDownOnSuccess(t *testing.T) {
 	client := NewTestNamingClient()
 	cb := func(model.FuzzyWatchChangeEvent) {}
 	param := &vo.FuzzyWatchParam{ServiceNamePattern: "order*", WatchCallback: cb}
-	assert.NoError(t, client.FuzzyWatch(param))
-	// registering was recorded in the holder
+	require.NoError(t, client.FuzzyWatch(param))
 	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
-	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern)
-	// cancel removes the pattern once the last callback is gone
-	assert.NoError(t, client.CancelFuzzyWatch(param))
+	require.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern)
+
+	require.NoError(t, client.CancelFuzzyWatch(param))
 	assert.NotContains(t, client.fuzzyWatchHolder.Patterns(), pattern)
+}
+
+// TestCancelFuzzyWatch_NilCallbackAllowed is a regression test: cancellation
+// no longer requires param.WatchCallback (it is pattern-scoped, not
+// callback-scoped), so a nil callback must be accepted.
+func TestCancelFuzzyWatch_NilCallbackAllowed(t *testing.T) {
+	client := NewTestNamingClient()
+	require.NoError(t, client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	}))
+
+	err := client.CancelFuzzyWatch(&vo.FuzzyWatchParam{ServiceNamePattern: "order*"})
+	assert.NoError(t, err)
 }
