@@ -116,7 +116,10 @@ type INamingClient interface {
 	// WatchCallback require
 	FuzzyWatch(param *vo.FuzzyWatchParam) error
 
-	// CancelFuzzyWatch use to cancel a fuzzy watch
+	// CancelFuzzyWatch use to cancel a fuzzy watch. It cancels the whole
+	// pattern - every callback registered for it, and the server-side watch -
+	// unconditionally; it is not yet scoped to just the given WatchCallback
+	// (Task 9 tracks per-callback teardown)
 	// ServiceNamePattern require
 	// GroupNamePattern optional,default:DEFAULT_GROUP
 	// WatchCallback require

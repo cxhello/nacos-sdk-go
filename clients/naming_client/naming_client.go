@@ -417,12 +417,18 @@ func (sc *NamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) error {
 		return errors.New("watchCallback cannot be nil!")
 	}
 	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
+	// TODO(Task 9): track the returned id/created so a failed FuzzyWatch RPC
+	// below can roll back this registration via RemoveCallbackByID instead
+	// of leaving an orphaned local callback.
 	sc.fuzzyWatchHolder.RegisterPattern(pattern, param.WatchCallback)
 	return sc.serviceProxy.FuzzyWatch(pattern, sc.fuzzyWatchHolder.ReceivedGroupKeys(pattern), true)
 }
 
-// CancelFuzzyWatch removes a fuzzy watch callback. The server-side watch is torn
-// down only once the pattern has no callbacks left.
+// CancelFuzzyWatch cancels the fuzzy watch for the given pattern. It tears
+// down the whole pattern - local callbacks and the server-side watch -
+// unconditionally; per-callback bookkeeping (registering how many callers
+// still want this pattern before canceling the server side) is Task 9's
+// responsibility, not this one.
 func (sc *NamingClient) CancelFuzzyWatch(param *vo.FuzzyWatchParam) error {
 	if param.ServiceNamePattern == "" {
 		return errors.New("serviceNamePattern cannot be empty!")
@@ -434,9 +440,6 @@ func (sc *NamingClient) CancelFuzzyWatch(param *vo.FuzzyWatchParam) error {
 		return errors.New("watchCallback cannot be nil!")
 	}
 	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
-	if remaining := sc.fuzzyWatchHolder.RemoveCallback(pattern, param.WatchCallback); remaining > 0 {
-		return nil
-	}
 	sc.fuzzyWatchHolder.RemovePattern(pattern)
 	return sc.serviceProxy.CancelFuzzyWatch(pattern)
 }

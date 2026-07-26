@@ -20,6 +20,7 @@ import (
 	"sort"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -49,11 +50,28 @@ func (s *eventSink) snapshot() []model.FuzzyWatchChangeEvent {
 	return out
 }
 
+func (s *eventSink) len() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.events)
+}
+
 func syncCtx(serviceKey, changedType string) rpc_request.NamingFuzzyWatchSyncContext {
 	return rpc_request.NamingFuzzyWatchSyncContext{ServiceKey: serviceKey, ChangedType: changedType}
 }
 
 const testPattern = "public>>DEFAULT_GROUP>>order*"
+
+// waitForEvents blocks until sink has collected exactly n events, polling
+// because dispatch is asynchronous now (drain runs on its own goroutine
+// rather than delivering synchronously to the caller). Fails the test on
+// timeout.
+func waitForEvents(t *testing.T, sink *eventSink, n int, msgAndArgs ...interface{}) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		return sink.len() == n
+	}, 2*time.Second, 5*time.Millisecond, msgAndArgs...)
+}
 
 func TestHolderInitBatchingAndFinish(t *testing.T) {
 	holder := NewFuzzyWatchServiceListHolder("public")
@@ -74,8 +92,8 @@ func TestHolderInitBatchingAndFinish(t *testing.T) {
 	holder.HandleSync(testPattern, constant.FINISH_FUZZY_WATCH_INIT_NOTIFY, nil, 2, 2)
 	assert.True(t, holder.isInitialized(testPattern), "FINISH marks initialized")
 
+	waitForEvents(t, sink, 3, "one ADD callback per matched service across both batches")
 	events := sink.snapshot()
-	require.Len(t, events, 3, "one ADD callback per matched service across both batches")
 	for _, e := range events {
 		assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, e.ChangedType)
 		assert.Equal(t, "public", e.NamespaceId)
@@ -103,7 +121,12 @@ func TestHolderDuplicateAddDoesNotRefire(t *testing.T) {
 	// server re-sends the same key (e.g. redo DIFF): must not re-fire.
 	holder.HandleSync(testPattern, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, add, 1, 1)
 
-	assert.Len(t, sink.snapshot(), 1, "duplicate ADD for a known key must not re-fire")
+	waitForEvents(t, sink, 1, "duplicate ADD for a known key must not re-fire")
+	// waitForEvents only proves the count reached 1 at some poll instant; it
+	// cannot see a spurious 2nd event fired a moment later. Settle briefly
+	// and re-check that the count is still exactly 1.
+	time.Sleep(75 * time.Millisecond)
+	assert.Equal(t, 1, sink.len(), "count must still be 1 after settling; a late duplicate fire would only show up here")
 	assert.Len(t, holder.ReceivedGroupKeys(testPattern), 1)
 }
 
@@ -130,8 +153,8 @@ func TestHolderDiffAddAndDelete(t *testing.T) {
 		"public@@DEFAULT_GROUP@@order-c",
 	}, keys)
 
+	waitForEvents(t, sink, 4, "2 initial ADD + 1 DIFF ADD + 1 DIFF DELETE")
 	events := sink.snapshot()
-	require.Len(t, events, 4, "2 initial ADD + 1 DIFF ADD + 1 DIFF DELETE")
 	last := events[3]
 	assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE, last.ChangedType)
 	assert.Equal(t, "order-a", last.ServiceName)
@@ -146,6 +169,7 @@ func TestHolderUnknownDeleteDoesNotFire(t *testing.T) {
 		syncCtx("public@@DEFAULT_GROUP@@order-unknown", constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE),
 	}, 1, 1)
 
+	// Nothing was ever enqueued, so there's no drain race to wait out.
 	assert.Empty(t, sink.snapshot(), "DELETE for an unknown key must not fire")
 	assert.Empty(t, holder.ReceivedGroupKeys(testPattern))
 }
@@ -160,8 +184,8 @@ func TestHolderMalformedServiceKeySkipped(t *testing.T) {
 		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
 	}, 1, 1)
 
+	waitForEvents(t, sink, 1, "malformed serviceKey is skipped, the valid one still fires")
 	events := sink.snapshot()
-	require.Len(t, events, 1, "malformed serviceKey is skipped, the valid one still fires")
 	assert.Equal(t, "order-a", events[0].ServiceName)
 	assert.Equal(t, []string{"public@@DEFAULT_GROUP@@order-a"}, holder.ReceivedGroupKeys(testPattern))
 }
@@ -177,17 +201,21 @@ func TestHolderChangeNotifyMatchingPatternOnly(t *testing.T) {
 	// against every registered pattern.
 	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-x", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
 
-	assert.Len(t, orderSink.snapshot(), 1, "matching pattern receives the change")
+	waitForEvents(t, orderSink, 1, "matching pattern receives the change")
 	assert.Empty(t, userSink.snapshot(), "non-matching pattern is untouched")
 	assert.Equal(t, []string{"public@@DEFAULT_GROUP@@order-x"}, holder.ReceivedGroupKeys("public>>DEFAULT_GROUP>>order*"))
 
 	// duplicate ADD via change notify does not re-fire
 	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-x", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
-	assert.Len(t, orderSink.snapshot(), 1)
 
 	// delete removes and fires
 	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-x", constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE)
-	assert.Len(t, orderSink.snapshot(), 2)
+	waitForEvents(t, orderSink, 2, "duplicate ADD does not re-fire, DELETE does")
+	// waitForEvents only proves the count reached 2 at some poll instant; it
+	// cannot see a spurious 3rd event (the duplicate ADD firing late).
+	// Settle briefly and re-check that the count is still exactly 2.
+	time.Sleep(75 * time.Millisecond)
+	assert.Equal(t, 2, orderSink.len(), "count must still be 2 after settling; a late duplicate fire would only show up here")
 	assert.Empty(t, holder.ReceivedGroupKeys("public>>DEFAULT_GROUP>>order*"))
 }
 
@@ -248,8 +276,8 @@ func TestHandleChangeNotifyContainsPatternReceivesEvent(t *testing.T) {
 
 	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@my-order-service", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
 
+	waitForEvents(t, sink, 1, "contains-mode pattern must receive its change-notify")
 	events := sink.snapshot()
-	require.Len(t, events, 1, "contains-mode pattern must receive its change-notify")
 	assert.Equal(t, "my-order-service", events[0].ServiceName)
 	assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, events[0].ChangedType)
 }
@@ -261,39 +289,127 @@ func TestHandleChangeNotifySuffixPatternReceivesEvent(t *testing.T) {
 
 	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-service", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
 
-	require.Len(t, sink.snapshot(), 1, "suffix-mode pattern must receive its change-notify")
+	waitForEvents(t, sink, 1, "suffix-mode pattern must receive its change-notify")
 }
 
-func TestHolderDuplicateRegisterDedupesCallback(t *testing.T) {
+// TestHandleSyncIgnoresUnknownPattern is a regression test asserting that a
+// late server sync must never recreate a pattern context the user already
+// canceled (or one that was never registered). HandleSync uses get(), which
+// only looks up an existing context rather than creating one on demand, so
+// an unknown pattern is dropped rather than resurrected.
+func TestHandleSyncIgnoresUnknownPattern(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+	}, 1, 1)
+
+	assert.NotContains(t, holder.Patterns(), testPattern, "HandleSync must not resurrect a canceled/unknown pattern")
+}
+
+// TestCallbacksRunOffCallerGoroutine is a regression test asserting that a
+// callback that blocks must not block the caller (in production, the gRPC
+// push-handler goroutine that has to ACK the server request). HandleSync
+// must return promptly even though the callback
+// it queued has not run yet.
+func TestCallbacksRunOffCallerGoroutine(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	started := make(chan struct{})
+	release := make(chan struct{})
+	holder.RegisterPattern(testPattern, func(model.FuzzyWatchChangeEvent) {
+		close(started)
+		<-release
+	})
+
+	handleSyncDone := make(chan struct{})
+	go func() {
+		holder.HandleSync(testPattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+			syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+		}, 1, 1)
+		close(handleSyncDone)
+	}()
+
+	select {
+	case <-handleSyncDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("HandleSync must return promptly even though its callback is blocked")
+	}
+
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("callback was never dispatched off the caller goroutine")
+	}
+	close(release)
+}
+
+// TestEventsDeliveredInOrder asserts the async dispatcher preserves
+// per-pattern delivery order: a single drain goroutine per context means
+// events are never reordered even though they run off the caller goroutine.
+func TestEventsDeliveredInOrder(t *testing.T) {
 	holder := NewFuzzyWatchServiceListHolder("public")
 	sink := &eventSink{}
 	holder.RegisterPattern(testPattern, sink.cb)
-	holder.RegisterPattern(testPattern, sink.cb) // same code pointer -> deduped
 
-	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
-	assert.Len(t, sink.snapshot(), 1, "same callback registered twice fires once")
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_INIT_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+	}, 1, 1)
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE),
+	}, 1, 1)
+	holder.HandleSync(testPattern, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, []rpc_request.NamingFuzzyWatchSyncContext{
+		syncCtx("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE),
+	}, 1, 1)
+
+	waitForEvents(t, sink, 3, "ADD/DELETE/ADD must all be delivered")
+	events := sink.snapshot()
+	require.Len(t, events, 3)
+	assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, events[0].ChangedType)
+	assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE, events[1].ChangedType)
+	assert.Equal(t, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, events[2].ChangedType)
 }
 
-func TestHolderRemoveCallbackAndPattern(t *testing.T) {
+// TestRegisterPatternAppendsDuplicates documents that RegisterPattern no
+// longer dedupes by code pointer: registering the same func value twice
+// yields two distinct ids and both fire independently, matching the Java
+// client where two distinct watcher objects both receive the event.
+func TestRegisterPatternAppendsDuplicates(t *testing.T) {
 	holder := NewFuzzyWatchServiceListHolder("public")
-	// Two distinct func literals: distinct code pointers, so they are not
-	// deduped against each other (unlike method values, which share a code
-	// pointer regardless of receiver).
-	var aCount, bCount int
-	cbA := func(model.FuzzyWatchChangeEvent) { aCount++ }
-	cbB := func(model.FuzzyWatchChangeEvent) { bCount++ }
-	holder.RegisterPattern(testPattern, cbA)
-	holder.RegisterPattern(testPattern, cbB)
+	sink := &eventSink{}
+	id1, created1 := holder.RegisterPattern(testPattern, sink.cb)
+	id2, created2 := holder.RegisterPattern(testPattern, sink.cb)
 
-	remaining := holder.RemoveCallback(testPattern, cbA)
-	assert.Equal(t, 1, remaining, "one callback left after removing the other")
+	assert.True(t, created1, "first registration creates the pattern context")
+	assert.False(t, created2, "second registration reuses the existing pattern context")
+	assert.NotEqual(t, id1, id2, "each registration is a distinct id, even for the same callback value")
 
 	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
-	assert.Equal(t, 0, aCount, "removed callback no longer fires")
-	assert.Equal(t, 1, bCount)
 
-	remaining = holder.RemoveCallback(testPattern, cbB)
-	assert.Equal(t, 0, remaining)
+	waitForEvents(t, sink, 2, "duplicate registration is not deduped; the event is delivered once per registration")
+}
+
+func TestHolderRemoveCallbackByIDAndPattern(t *testing.T) {
+	holder := NewFuzzyWatchServiceListHolder("public")
+	var aCount, bCount int
+	var mu sync.Mutex
+	cbA := func(model.FuzzyWatchChangeEvent) { mu.Lock(); aCount++; mu.Unlock() }
+	cbB := func(model.FuzzyWatchChangeEvent) { mu.Lock(); bCount++; mu.Unlock() }
+	idA, _ := holder.RegisterPattern(testPattern, cbA)
+	idB, _ := holder.RegisterPattern(testPattern, cbB)
+
+	holder.RemoveCallbackByID(testPattern, idA)
+
+	holder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return bCount == 1
+	}, 2*time.Second, 5*time.Millisecond, "surviving registration still fires")
+	mu.Lock()
+	assert.Equal(t, 0, aCount, "removed registration no longer fires")
+	mu.Unlock()
+
+	holder.RemoveCallbackByID(testPattern, idB)
 	holder.RemovePattern(testPattern)
 	assert.Empty(t, holder.ReceivedGroupKeys(testPattern))
 	assert.Empty(t, holder.Patterns())
