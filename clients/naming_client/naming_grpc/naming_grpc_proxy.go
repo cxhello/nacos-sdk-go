@@ -18,6 +18,7 @@ package naming_grpc
 
 import (
 	"context"
+	"sync"
 	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
@@ -41,6 +42,18 @@ type NamingGrpcProxy struct {
 	rpcClient         rpc.IRpcClient
 	eventListener     *ConnectionEventListener
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	// send performs the actual server round-trip; it defaults to
+	// requestToServer and is swapped out in tests so the request sequence can
+	// be asserted without a live rpc client.
+	send func(request rpc_request.IRequest) (rpc_response.IResponse, error)
+	// redoMu is the redo-cache monitor: it mirrors Java NamingGrpcRedoService's
+	// synchronized(registeredInstances), serializing every read-modify-write of
+	// the instance redo cache across RegisterInstance, BatchRegisterInstance,
+	// and DeregisterInstance. The batch-deregister path additionally holds it
+	// across the republish send, mirroring Java NamingGrpcClientProxy's
+	// batchDeregisterService, so a concurrent register cannot interleave
+	// between the retained-set computation and its publication.
+	redoMu sync.Mutex
 }
 
 // NewNamingGrpcProxy create naming grpc proxy
@@ -51,6 +64,7 @@ func NewNamingGrpcProxy(ctx context.Context, clientCfg constant.ClientConfig, na
 		nacosServer:       nacosServer,
 		serviceInfoHolder: serviceInfoHolder,
 	}
+	srvProxy.send = srvProxy.requestToServer
 
 	uid, err := uuid.NewV4()
 	if err != nil {
@@ -90,43 +104,99 @@ func (proxy *NamingGrpcProxy) requestToServer(request rpc_request.IRequest) (rpc
 	return response, err
 }
 
-// RegisterInstance ...
+// RegisterInstance registers one instance and caches it in single-request
+// shape for reconnect redo (Java parity: registerServiceForEphemeral). The
+// server keeps ONE publication per (connection, service) and a second
+// registerInstance on the same client REPLACES it (verified on Nacos
+// 2.5.2/3.1.0/3.2.0, issue #866): to publish several instances of one
+// service from one client, use BatchRegisterInstance.
 func (proxy *NamingGrpcProxy) RegisterInstance(serviceName string, groupName string, instance model.Instance) (bool, error) {
 	logger.Infof("register instance namespaceId:<%s>,serviceName:<%s> with instance:<%s>",
 		proxy.clientConfig.NamespaceId, serviceName, util.ToJsonString(instance))
+	proxy.redoMu.Lock()
 	proxy.eventListener.CacheInstanceForRedo(serviceName, groupName, instance)
+	proxy.redoMu.Unlock()
 	instanceRequest := rpc_request.NewInstanceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, "registerInstance", instance)
-	response, err := proxy.requestToServer(instanceRequest)
+	response, err := proxy.send(instanceRequest)
 	if err != nil {
 		return false, err
 	}
-	return response.IsSuccess(), err
+	return response.IsSuccess(), nil
 }
 
-// BatchRegisterInstance ...
+// BatchRegisterInstance wholesale-replaces the service publication and caches
+// the list in batch shape for redo. instances may legally be empty ([] clears
+// the publication server-side, probe-verified 2.5.2/3.2.0) but must not be
+// nil: nil marshals to JSON null, which 3.x rejects with an NPE.
 func (proxy *NamingGrpcProxy) BatchRegisterInstance(serviceName string, groupName string, instances []model.Instance) (bool, error) {
+	if instances == nil {
+		instances = make([]model.Instance, 0)
+	}
 	logger.Infof("batch register instance namespaceId:<%s>,serviceName:<%s> with instance:<%s>",
 		proxy.clientConfig.NamespaceId, serviceName, util.ToJsonString(instances))
+	proxy.redoMu.Lock()
 	proxy.eventListener.CacheInstancesForRedo(serviceName, groupName, instances)
+	proxy.redoMu.Unlock()
 	batchInstanceRequest := rpc_request.NewBatchInstanceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, "batchRegisterInstance", instances)
-	response, err := proxy.requestToServer(batchInstanceRequest)
+	response, err := proxy.send(batchInstanceRequest)
 	if err != nil {
 		return false, err
 	}
-	return response.IsSuccess(), err
+	return response.IsSuccess(), nil
 }
 
-// DeregisterInstance ...
+// DeregisterInstance mirrors Java's deregisterServiceForEphemeral: when the
+// service was last published in batch shape, the instance is removed from the
+// retained list and the remainder is re-published as a batch (a plain
+// deregisterInstance can never shrink a batch publication - it is a server-
+// side no-op against batch shape, probe-verified 2.5.2/3.2.0). Only a
+// single-shape (or never-registered) service sends a plain deregister.
+//
+// redoMu is taken FIRST, before the shape check: this makes the check and the
+// subsequent cache mutation+send atomic with respect to concurrent
+// RegisterInstance/BatchRegisterInstance/DeregisterInstance calls, so there is
+// no shape-flip window to retry around (unlike a check-then-lock design).
 func (proxy *NamingGrpcProxy) DeregisterInstance(serviceName string, groupName string, instance model.Instance) (bool, error) {
 	logger.Infof("deregister instance namespaceId:<%s>,serviceName:<%s> with instance:<%s:%d@%s>",
 		proxy.clientConfig.NamespaceId, serviceName, instance.Ip, instance.Port, instance.ClusterName)
-	instanceRequest := rpc_request.NewInstanceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, "deregisterInstance", instance)
-	response, err := proxy.requestToServer(instanceRequest)
+	proxy.redoMu.Lock()
+	if batchInstances, isBatch := proxy.eventListener.GetBatchInstancesForRedo(serviceName, groupName); isBatch {
+		defer proxy.redoMu.Unlock()
+		// Remove the first ip:port match from the retained batch (Java parity:
+		// getRetainInstance compares only Ip and Port and removes a single
+		// match) - unchanged when the instance is unknown, empty when it was
+		// the last member. The cache+send stays inline (rather than delegating
+		// to BatchRegisterInstance) because that method takes redoMu itself,
+		// and Go's sync.Mutex is not reentrant.
+		retained := make([]model.Instance, 0, len(batchInstances))
+		removed := false
+		for _, inst := range batchInstances {
+			if !removed && inst.Ip == instance.Ip && inst.Port == instance.Port {
+				removed = true
+				continue
+			}
+			retained = append(retained, inst)
+		}
+		// retained may legally be an empty (non-nil) slice after the last
+		// member is deregistered: the batch redo entry lingers rather than
+		// being deleted, mirroring Java - a later redo replay simply resends
+		// this harmless empty batch, which keeps the publication cleared.
+		proxy.eventListener.CacheInstancesForRedo(serviceName, groupName, retained)
+		batchInstanceRequest := rpc_request.NewBatchInstanceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, "batchRegisterInstance", retained)
+		response, err := proxy.send(batchInstanceRequest)
+		if err != nil {
+			return false, err
+		}
+		return response.IsSuccess(), nil
+	}
 	proxy.eventListener.RemoveInstanceForRedo(serviceName, groupName, instance)
+	proxy.redoMu.Unlock()
+	instanceRequest := rpc_request.NewInstanceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, "deregisterInstance", instance)
+	response, err := proxy.send(instanceRequest)
 	if err != nil {
 		return false, err
 	}
-	return response.IsSuccess(), err
+	return response.IsSuccess(), nil
 }
 
 // GetServiceList ...
@@ -140,7 +210,7 @@ func (proxy *NamingGrpcProxy) GetServiceList(pageNo uint32, pageSize uint32, gro
 			break
 		}
 	}
-	response, err := proxy.requestToServer(rpc_request.NewServiceListRequest(namespaceId, "",
+	response, err := proxy.send(rpc_request.NewServiceListRequest(namespaceId, "",
 		groupName, int(pageNo), int(pageSize), selectorStr))
 	if err != nil {
 		return model.ServiceList{}, err
@@ -159,7 +229,7 @@ func (proxy *NamingGrpcProxy) ServerHealthy() bool {
 
 // QueryInstancesOfService ...
 func (proxy *NamingGrpcProxy) QueryInstancesOfService(serviceName, groupName, cluster string, udpPort int, healthyOnly bool) (*model.Service, error) {
-	response, err := proxy.requestToServer(rpc_request.NewServiceQueryRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, cluster,
+	response, err := proxy.send(rpc_request.NewServiceQueryRequest(proxy.clientConfig.NamespaceId, serviceName, groupName, cluster,
 		healthyOnly, udpPort))
 	if err != nil {
 		return nil, err
@@ -180,7 +250,7 @@ func (proxy *NamingGrpcProxy) Subscribe(serviceName, groupName string, clusters 
 	request := rpc_request.NewSubscribeServiceRequest(proxy.clientConfig.NamespaceId, serviceName,
 		groupName, clusters, true)
 	request.Headers["app"] = proxy.clientConfig.AppName
-	response, err := proxy.requestToServer(request)
+	response, err := proxy.send(request)
 	if err != nil {
 		return model.Service{}, err
 	}
@@ -193,7 +263,7 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 	logger.Infof("Unsubscribe Service namespaceId:<%s>, serviceName:<%s>, groupName:<%s>, clusters:<%s>",
 		proxy.clientConfig.NamespaceId, serviceName, groupName, clusters)
 	proxy.eventListener.RemoveSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
-	_, err := proxy.requestToServer(rpc_request.NewSubscribeServiceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName,
+	_, err := proxy.send(rpc_request.NewSubscribeServiceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName,
 		clusters, false))
 	return err
 }

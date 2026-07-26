@@ -113,6 +113,20 @@ func (c *ConnectionEventListener) RemoveInstanceForRedo(serviceName, groupName s
 	c.registeredInstanceCached.Remove(key)
 }
 
+// GetBatchInstancesForRedo returns the cached batch-shape redo list for the
+// service, if and only if the service was last published via batch
+// registration. Mirrors Java's redoService.getRegisteredInstancesByKey +
+// instanceof BatchInstanceRedoData check.
+func (c *ConnectionEventListener) GetBatchInstancesForRedo(serviceName, groupName string) ([]model.Instance, bool) {
+	key := util.GetGroupName(serviceName, groupName)
+	v, ok := c.registeredInstanceCached.Get(key)
+	if !ok {
+		return nil, false
+	}
+	instances, ok := v.([]model.Instance)
+	return instances, ok
+}
+
 func (c *ConnectionEventListener) CacheSubscriberForRedo(fullServiceName, clusters string) {
 	key := util.GetServiceCacheKey(fullServiceName, clusters)
 	if !c.IsSubscriberCached(key) {
