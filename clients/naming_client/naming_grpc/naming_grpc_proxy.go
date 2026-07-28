@@ -21,6 +21,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pkg/errors"
+
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
@@ -263,12 +265,22 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 	logger.Infof("Unsubscribe Service namespaceId:<%s>, serviceName:<%s>, groupName:<%s>, clusters:<%s>",
 		proxy.clientConfig.NamespaceId, serviceName, groupName, clusters)
 	proxy.eventListener.RemoveSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
-	_, err := proxy.send(rpc_request.NewSubscribeServiceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName,
+	response, err := proxy.send(rpc_request.NewSubscribeServiceRequest(proxy.clientConfig.NamespaceId, serviceName, groupName,
 		clusters, false))
+	if err == nil && response == nil {
+		err = errors.Errorf("unsubscribe %s got nil response", util.GetGroupName(serviceName, groupName))
+	}
+	if err == nil && !response.IsSuccess() {
+		// The rpc client returns (response, nil) for a response the server
+		// answered but did not accept; that is still a failed unsubscribe
+		// and must not be silently treated as success.
+		err = errors.Errorf("unsubscribe %s failed, resultCode:%d message:%s",
+			util.GetGroupName(serviceName, groupName), response.GetResultCode(), response.GetMessage())
+	}
 	if err != nil {
-		// the server-side unsubscribe request failed, so the server keeps
-		// pushing updates for this subscription; restore the redo cache
-		// entry so a reconnect keeps re-subscribing until a later
+		// the server-side unsubscribe did not take effect, so the server
+		// keeps pushing updates for this subscription; restore the redo
+		// cache entry so a reconnect keeps re-subscribing until a later
 		// unsubscribe call actually succeeds.
 		proxy.eventListener.CacheSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
 	}

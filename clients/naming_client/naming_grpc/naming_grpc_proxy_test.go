@@ -347,3 +347,24 @@ func TestUnsubscribeRestoresRedoOnFailure(t *testing.T) {
 	assert.Error(t, err)
 	assert.True(t, proxy.eventListener.IsSubscriberCached(util.GetServiceCacheKey(util.GetGroupName("svc", "g"), "")))
 }
+
+// A response the server answered but did not accept (IsSuccess()==false)
+// arrives as (response, nil) from the rpc client, not as a transport error.
+// It must be treated exactly like a failure: surface an error and restore
+// the redo entry, otherwise the server keeps pushing a subscription the
+// client no longer tracks and reconnect never re-subscribes.
+func TestUnsubscribeRestoresRedoOnUnsuccessfulResponse(t *testing.T) {
+	proxy, _ := newTestProxy()
+	proxy.eventListener.CacheSubscriberForRedo(util.GetGroupName("svc", "g"), "")
+	proxy.send = func(r rpc_request.IRequest) (rpc_response.IResponse, error) {
+		return &rpc_response.SubscribeServiceResponse{
+			Response: &rpc_response.Response{Success: false, ResultCode: 500, Message: "server rejected"},
+		}, nil
+	}
+
+	err := proxy.Unsubscribe("svc", "g", "")
+
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "server rejected")
+	assert.True(t, proxy.eventListener.IsSubscriberCached(util.GetServiceCacheKey(util.GetGroupName("svc", "g"), "")))
+}
