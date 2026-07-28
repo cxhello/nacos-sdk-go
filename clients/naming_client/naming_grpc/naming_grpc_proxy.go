@@ -53,8 +53,15 @@ type NamingGrpcProxy struct {
 	// the instance redo cache across RegisterInstance, BatchRegisterInstance,
 	// and DeregisterInstance. The batch-deregister path additionally holds it
 	// across the republish send, mirroring Java NamingGrpcClientProxy's
-	// batchDeregisterService, so a concurrent register cannot interleave
-	// between the retained-set computation and its publication.
+	// batchDeregisterService, so a concurrent register's cache write cannot
+	// interleave between the retained-set computation and the cache write it
+	// is derived from. Send ordering is NOT guaranteed: Register and
+	// BatchRegister release the mutex before sending, so a request already in
+	// flight when a deregister runs can still land afterwards and leave the
+	// server briefly different from the redo cache — the same inversion
+	// exists in Java, where doRegisterService/doBatchRegisterService also run
+	// outside the monitor; the redo replay reconverges the server on the next
+	// reconnect.
 	redoMu sync.Mutex
 }
 
