@@ -151,3 +151,38 @@ func TestDecodeProtoNotifySubscriberRequest(t *testing.T) {
 	require.Len(t, n.ServiceInfo.Hosts, 1)
 	assert.True(t, n.ServiceInfo.Hosts[0].Enable)
 }
+
+// The proto Instance has no heartbeat lifecycle fields; the legacy JSON wire
+// carried them because the server serializes Java's metadata-derived getters.
+// The adapter must reproduce that derivation so callers reading
+// model.Instance keep seeing the same values as on the JSON path.
+func TestFromProtoInstanceHeartbeatDefaults(t *testing.T) {
+	inst := fromProtoInstance(&naming.Instance{Ip: "1.1.1.1", Port: 8080})
+	assert.Equal(t, 5000, inst.InstanceHeartBeatInterval)
+	assert.Equal(t, 15000, inst.InstanceHeartBeatTimeOut)
+	assert.Equal(t, 30000, inst.IpDeleteTimeout)
+}
+
+func TestFromProtoInstanceHeartbeatMetadataOverrides(t *testing.T) {
+	inst := fromProtoInstance(&naming.Instance{Ip: "1.1.1.1", Port: 8080, Metadata: map[string]string{
+		"preserved.heart.beat.interval": "2000",
+		"preserved.heart.beat.timeout":  "6000",
+		"preserved.ip.delete.timeout":   "9000",
+	}})
+	assert.Equal(t, 2000, inst.InstanceHeartBeatInterval)
+	assert.Equal(t, 6000, inst.InstanceHeartBeatTimeOut)
+	assert.Equal(t, 9000, inst.IpDeleteTimeout)
+}
+
+// Java only accepts values matching ^\d+$ (getMetaDataByKeyWithDefault);
+// anything else falls back to the default.
+func TestFromProtoInstanceHeartbeatInvalidMetadataFallsBack(t *testing.T) {
+	inst := fromProtoInstance(&naming.Instance{Ip: "1.1.1.1", Port: 8080, Metadata: map[string]string{
+		"preserved.heart.beat.interval": "abc",
+		"preserved.heart.beat.timeout":  "-1",
+		"preserved.ip.delete.timeout":   "",
+	}})
+	assert.Equal(t, 5000, inst.InstanceHeartBeatInterval)
+	assert.Equal(t, 15000, inst.InstanceHeartBeatTimeOut)
+	assert.Equal(t, 30000, inst.IpDeleteTimeout)
+}

@@ -17,16 +17,45 @@
 package rpc
 
 import (
+	"strconv"
+
 	"github.com/nacos-group/nacos-sdk-proto/go/naming"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 )
 
+// Java defaults for the metadata-derived heartbeat lifecycle fields
+// (com.alibaba.nacos.api.common.Constants: DEFAULT_HEART_BEAT_INTERVAL /
+// DEFAULT_HEART_BEAT_TIMEOUT / DEFAULT_IP_DELETE_TIMEOUT, in milliseconds).
+const (
+	defaultHeartBeatInterval = 5000
+	defaultHeartBeatTimeout  = 15000
+	defaultIpDeleteTimeout   = 30000
+)
+
+// metadataIntWithDefault mirrors Java Instance#getMetaDataByKeyWithDefault:
+// only a plain non-negative integer string overrides the default; anything
+// missing or malformed falls back.
+func metadataIntWithDefault(metadata map[string]string, key string, def int) int {
+	v, ok := metadata[key]
+	if !ok || v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return def
+	}
+	return n
+}
+
 // fromProtoInstance adapts a proto Instance to the legacy model struct.
 // The proto definition has no instanceHeartBeatInterval /
-// instanceHeartBeatTimeOut / ipDeleteTimeout fields (Java derives them
-// from metadata server-side); they stay zero here and nothing in the SDK
-// reads them on the subscribe/query paths.
+// instanceHeartBeatTimeOut / ipDeleteTimeout fields: on the legacy JSON
+// wire the server serializes Java's metadata-derived getters, so the
+// adapter reproduces that derivation (preserved.* metadata keys with the
+// Java defaults) to keep the exported model.Instance fields identical
+// across both wire formats.
 func fromProtoInstance(i *naming.Instance) model.Instance {
 	if i == nil {
 		return model.Instance{}
@@ -42,6 +71,12 @@ func fromProtoInstance(i *naming.Instance) model.Instance {
 		ClusterName: i.ClusterName,
 		ServiceName: i.ServiceName,
 		Metadata:    i.Metadata,
+		InstanceHeartBeatInterval: metadataIntWithDefault(i.Metadata,
+			constant.HEART_BEAT_INTERVAL, defaultHeartBeatInterval),
+		InstanceHeartBeatTimeOut: metadataIntWithDefault(i.Metadata,
+			constant.HEART_BEAT_TIMEOUT, defaultHeartBeatTimeout),
+		IpDeleteTimeout: metadataIntWithDefault(i.Metadata,
+			constant.IP_DELETE_TIMEOUT, defaultIpDeleteTimeout),
 	}
 }
 
