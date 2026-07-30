@@ -35,15 +35,21 @@ const (
 )
 
 // metadataIntWithDefault mirrors Java Instance#getMetaDataByKeyWithDefault:
-// only a plain non-negative integer string overrides the default; anything
-// missing or malformed falls back.
+// only a digits-only string (Java's ^\d+$ check — no sign prefix, so "+1000"
+// and "-0" also fall back) overrides the default; anything missing or
+// malformed falls back.
 func metadataIntWithDefault(metadata map[string]string, key string, def int) int {
 	v, ok := metadata[key]
 	if !ok || v == "" {
 		return def
 	}
+	for _, c := range v {
+		if c < '0' || c > '9' {
+			return def
+		}
+	}
 	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
+	if err != nil {
 		return def
 	}
 	return n

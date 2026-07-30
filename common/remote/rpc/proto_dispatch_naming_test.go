@@ -186,3 +186,14 @@ func TestFromProtoInstanceHeartbeatInvalidMetadataFallsBack(t *testing.T) {
 	assert.Equal(t, 15000, inst.InstanceHeartBeatTimeOut)
 	assert.Equal(t, 30000, inst.IpDeleteTimeout)
 }
+
+// strconv.Atoi accepts sign prefixes ("+1000", "-0") that Java's ^\d+$
+// check rejects; both must fall back to the defaults for exact parity.
+func TestFromProtoInstanceHeartbeatSignPrefixedMetadataFallsBack(t *testing.T) {
+	inst := fromProtoInstance(&naming.Instance{Ip: "1.1.1.1", Port: 8080, Metadata: map[string]string{
+		"preserved.heart.beat.interval": "+1000",
+		"preserved.heart.beat.timeout":  "-0",
+	}})
+	assert.Equal(t, 5000, inst.InstanceHeartBeatInterval)
+	assert.Equal(t, 15000, inst.InstanceHeartBeatTimeOut)
+}
