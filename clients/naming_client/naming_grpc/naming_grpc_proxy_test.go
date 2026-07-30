@@ -368,3 +368,63 @@ func TestUnsubscribeRestoresRedoOnUnsuccessfulResponse(t *testing.T) {
 	assert.Contains(t, err.Error(), "server rejected")
 	assert.True(t, proxy.eventListener.IsSubscriberCached(util.GetServiceCacheKey(util.GetGroupName("svc", "g"), "")))
 }
+
+// The proto wire carries ports as int32 while the public API exposes uint64:
+// an unchecked conversion would silently truncate 2^32+80 to 80 and make an
+// invalid register/deregister operate on a different, valid endpoint (the
+// legacy JSON wire sent the original value and let the server reject it).
+// Ports must therefore be rejected client-side before any redo-cache
+// mutation or request send.
+func TestRegisterInstanceRejectsOutOfRangePort(t *testing.T) {
+	proxy, sent := newTestProxy()
+	bad := model.Instance{Ip: "1.1.1.1", Port: 1<<32 + 80}
+
+	ok, err := proxy.RegisterInstance("svc", "group", bad)
+
+	assert.Error(t, err)
+	assert.False(t, ok)
+	assert.Contains(t, err.Error(), "port")
+	assert.Empty(t, *sent, "no request may be sent for an invalid port")
+	_, cached := proxy.eventListener.registeredInstanceCached.Get(util.GetGroupName("svc", "group"))
+	assert.False(t, cached, "redo cache must stay untouched")
+}
+
+func TestBatchRegisterInstanceRejectsOutOfRangePort(t *testing.T) {
+	proxy, sent := newTestProxy()
+	a := model.Instance{Ip: "1.1.1.1", Port: 8080}
+	seed := []model.Instance{a}
+	_, err := proxy.BatchRegisterInstance("svc", "group", seed)
+	assert.NoError(t, err)
+	*sent = (*sent)[:0]
+
+	bad := []model.Instance{a, {Ip: "2.2.2.2", Port: 1<<32 + 80}}
+	ok, err := proxy.BatchRegisterInstance("svc", "group", bad)
+
+	assert.Error(t, err)
+	assert.False(t, ok)
+	assert.Empty(t, *sent)
+	retained, isBatch := proxy.eventListener.GetBatchInstancesForRedo("svc", "group")
+	assert.True(t, isBatch)
+	assert.Equal(t, seed, retained, "redo cache must keep the previous valid set")
+}
+
+func TestDeregisterInstanceRejectsOutOfRangePort(t *testing.T) {
+	proxy, sent := newTestProxy()
+	a := model.Instance{Ip: "1.1.1.1", Port: 8080}
+	b := model.Instance{Ip: "2.2.2.2", Port: 8081}
+	_, err := proxy.BatchRegisterInstance("svc", "group", []model.Instance{a, b})
+	assert.NoError(t, err)
+	*sent = (*sent)[:0]
+
+	// 2^32+8080 truncates to 8080 as int32 — without validation this would
+	// republish the batch minus instance a's neighbor at the truncated port.
+	bad := model.Instance{Ip: "1.1.1.1", Port: 1<<32 + 8080}
+	ok, err := proxy.DeregisterInstance("svc", "group", bad)
+
+	assert.Error(t, err)
+	assert.False(t, ok)
+	assert.Empty(t, *sent)
+	retained, isBatch := proxy.eventListener.GetBatchInstancesForRedo("svc", "group")
+	assert.True(t, isBatch)
+	assert.Equal(t, []model.Instance{a, b}, retained)
+}

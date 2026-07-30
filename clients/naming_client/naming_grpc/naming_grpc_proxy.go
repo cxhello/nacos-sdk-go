@@ -113,6 +113,23 @@ func (proxy *NamingGrpcProxy) requestToServer(request rpc_request.IRequest) (rpc
 	return response, err
 }
 
+// maxInstancePort is the upper bound of the server's valid port range. The
+// proto wire carries ports as int32 while the public API exposes uint64: an
+// unchecked conversion would silently truncate an out-of-range value into a
+// different, valid port (2^32+80 becomes 80), so an invalid register or
+// deregister could operate on another live endpoint. The legacy JSON wire
+// sent the original value and let the server reject it; on the proto wire
+// the client must reject it before any redo-cache mutation or send.
+const maxInstancePort = 65535
+
+func validateInstancePort(serviceName string, instance model.Instance) error {
+	if instance.Port > maxInstancePort {
+		return errors.Errorf("invalid port %d for service %s instance %s: port must not exceed %d",
+			instance.Port, serviceName, instance.Ip, maxInstancePort)
+	}
+	return nil
+}
+
 // RegisterInstance registers one instance and caches it in single-request
 // shape for reconnect redo (Java parity: registerServiceForEphemeral). The
 // server keeps ONE publication per (connection, service) and a second
@@ -122,6 +139,9 @@ func (proxy *NamingGrpcProxy) requestToServer(request rpc_request.IRequest) (rpc
 func (proxy *NamingGrpcProxy) RegisterInstance(serviceName string, groupName string, instance model.Instance) (bool, error) {
 	logger.Infof("register instance namespaceId:<%s>,serviceName:<%s> with instance:<%s>",
 		proxy.clientConfig.NamespaceId, serviceName, util.ToJsonString(instance))
+	if err := validateInstancePort(serviceName, instance); err != nil {
+		return false, err
+	}
 	proxy.redoMu.Lock()
 	proxy.eventListener.CacheInstanceForRedo(serviceName, groupName, instance)
 	proxy.redoMu.Unlock()
@@ -143,6 +163,11 @@ func (proxy *NamingGrpcProxy) BatchRegisterInstance(serviceName string, groupNam
 	}
 	logger.Infof("batch register instance namespaceId:<%s>,serviceName:<%s> with instance:<%s>",
 		proxy.clientConfig.NamespaceId, serviceName, util.ToJsonString(instances))
+	for _, inst := range instances {
+		if err := validateInstancePort(serviceName, inst); err != nil {
+			return false, err
+		}
+	}
 	proxy.redoMu.Lock()
 	proxy.eventListener.CacheInstancesForRedo(serviceName, groupName, instances)
 	proxy.redoMu.Unlock()
@@ -161,13 +186,20 @@ func (proxy *NamingGrpcProxy) BatchRegisterInstance(serviceName string, groupNam
 // side no-op against batch shape, probe-verified 2.5.2/3.2.0). Only a
 // single-shape (or never-registered) service sends a plain deregister.
 //
-// redoMu is taken FIRST, before the shape check: this makes the check and the
-// subsequent cache mutation+send atomic with respect to concurrent
-// RegisterInstance/BatchRegisterInstance/DeregisterInstance calls, so there is
-// no shape-flip window to retry around (unlike a check-then-lock design).
+// redoMu is taken FIRST, before the shape check: this makes the shape check
+// and the subsequent CACHE mutation atomic with respect to the cache writes
+// of concurrent RegisterInstance/BatchRegisterInstance/DeregisterInstance
+// calls, so there is no shape-flip window to retry around (unlike a
+// check-then-lock design). As the struct-level redoMu comment notes, only
+// this deregister path holds the lock across its send; Register and
+// BatchRegister sends run outside the lock, so send ordering against them is
+// not guaranteed and reconverges via redo replay.
 func (proxy *NamingGrpcProxy) DeregisterInstance(serviceName string, groupName string, instance model.Instance) (bool, error) {
 	logger.Infof("deregister instance namespaceId:<%s>,serviceName:<%s> with instance:<%s:%d@%s>",
 		proxy.clientConfig.NamespaceId, serviceName, instance.Ip, instance.Port, instance.ClusterName)
+	if err := validateInstancePort(serviceName, instance); err != nil {
+		return false, err
+	}
 	proxy.redoMu.Lock()
 	if batchInstances, isBatch := proxy.eventListener.GetBatchInstancesForRedo(serviceName, groupName); isBatch {
 		defer proxy.redoMu.Unlock()
