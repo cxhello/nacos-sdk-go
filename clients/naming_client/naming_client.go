@@ -375,12 +375,22 @@ func (sc *NamingClient) Unsubscribe(param *vo.SubscribeParam) (err error) {
 	if param.ServiceName == "" {
 		return errors.New("serviceName cannot be empty!")
 	}
+	if len(param.GroupName) == 0 {
+		param.GroupName = constant.DEFAULT_GROUP
+	}
 	clusterSelector := naming_cache.NewClusterSelector(param.Clusters)
 	callbackWrapper := naming_cache.NewSubscribeCallbackFuncWrapper(clusterSelector, &param.SubscribeCallback)
 	serviceFullName := util.GetGroupName(param.ServiceName, param.GroupName)
 	sc.serviceInfoHolder.DeregisterCallback(serviceFullName, "", callbackWrapper)
 	if !sc.serviceInfoHolder.IsSubscribed(serviceFullName, "") {
 		err = sc.serviceProxy.Unsubscribe(param.ServiceName, param.GroupName, "")
+		if err != nil {
+			// server-side unsubscribe failed: the server keeps pushing
+			// updates for this service, so keep the local callback alive
+			// instead of leaving it half-removed (registered nowhere but
+			// still receiving no explicit unsubscribe on the wire).
+			sc.serviceInfoHolder.RegisterCallback(serviceFullName, "", callbackWrapper)
+		}
 	}
 
 	return err

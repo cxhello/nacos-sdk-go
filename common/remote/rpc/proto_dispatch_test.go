@@ -91,8 +91,8 @@ func TestDecodeProtoServerRequestClientDetection(t *testing.T) {
 }
 
 func TestDecodeProtoServerRequestUnmigratedFallsThrough(t *testing.T) {
-	_, ok := decodeProtoServerRequest(protoPayload("NotifySubscriberRequest", `{}`))
-	assert.False(t, ok, "naming push stays on the legacy path until PR4")
+	_, ok := decodeProtoServerRequest(protoPayload("ConfigChangeNotifyRequest", `{}`))
+	assert.False(t, ok, "config push stays on the legacy path until PR5")
 }
 
 func TestDecodeProtoServerRequestBadJsonFallsBack(t *testing.T) {

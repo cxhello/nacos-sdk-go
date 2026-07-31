@@ -17,6 +17,7 @@
 package naming_client
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
@@ -24,6 +25,7 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/nacos_client"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
+	"github.com/nacos-group/nacos-sdk-go/v3/util"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
 	"github.com/stretchr/testify/assert"
 )
@@ -39,6 +41,7 @@ var serverConfigTest = *constant.NewServerConfig("127.0.0.1", 80, constant.WithC
 type MockNamingProxy struct {
 	unsubscribeCalled bool
 	unsubscribeParams []string // 记录调用参数
+	unsubscribeErr    error    // 注入 Unsubscribe 失败
 }
 
 func (m *MockNamingProxy) RegisterInstance(serviceName string, groupName string, instance model.Instance) (bool, error) {
@@ -72,7 +75,7 @@ func (m *MockNamingProxy) Subscribe(serviceName, groupName, clusters string) (mo
 func (m *MockNamingProxy) Unsubscribe(serviceName, groupName, clusters string) error {
 	m.unsubscribeCalled = true
 	m.unsubscribeParams = []string{serviceName, groupName, clusters}
-	return nil
+	return m.unsubscribeErr
 }
 
 func (m *MockNamingProxy) CloseClient() {}
@@ -628,4 +631,67 @@ func TestNamingClient_Unsubscribe_Integration_Test(t *testing.T) {
 	assert.Nil(t, err)
 	assert.True(t, mockProxy.unsubscribeCalled)
 
+}
+
+// TestNamingClient_Unsubscribe_EmptyGroupNormalized regression test: Subscribe
+// normalizes an empty group to DEFAULT_GROUP but Unsubscribe did not, so the
+// callback registered under DEFAULT_GROUP@@svc was never found when
+// unsubscribing with an empty group.
+func TestNamingClient_Unsubscribe_EmptyGroupNormalized(t *testing.T) {
+	callback := func(services []model.Instance, err error) {
+		// 空回调函数
+	}
+	param := &vo.SubscribeParam{
+		ServiceName:       "svc",
+		GroupName:         "",
+		SubscribeCallback: callback,
+	}
+
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+
+	err := client.Subscribe(param)
+	assert.Nil(t, err)
+
+	// Subscribe normalizes param.GroupName to DEFAULT_GROUP as a side effect
+	// (param is a pointer), which would otherwise mask the bug under test.
+	// Reset it to "" so Unsubscribe is exercised with a genuinely empty
+	// group, matching real callers who unsubscribe with the empty group they
+	// originally configured.
+	param.GroupName = ""
+
+	err = client.Unsubscribe(param)
+	assert.Nil(t, err)
+
+	assert.True(t, mockProxy.unsubscribeCalled)
+	assert.Equal(t, []string{"svc", constant.DEFAULT_GROUP, ""}, mockProxy.unsubscribeParams)
+	assert.False(t, client.serviceInfoHolder.IsSubscribed(util.GetGroupName("svc", constant.DEFAULT_GROUP), ""))
+}
+
+// When the server-side unsubscribe fails (transport error or a response the
+// server did not accept), the server keeps pushing for this subscription, so
+// the locally deregistered callback must be re-registered — otherwise pushes
+// arrive with no handler while the caller believes the subscription is still
+// active (their Unsubscribe returned an error).
+func TestNamingClient_Unsubscribe_RestoresCallbackOnProxyFailure(t *testing.T) {
+	callback := func(services []model.Instance, err error) {}
+	param := &vo.SubscribeParam{
+		ServiceName:       "svc-restore",
+		GroupName:         "g",
+		SubscribeCallback: callback,
+	}
+
+	client := NewTestNamingClient()
+	mockProxy := client.serviceProxy.(*MockNamingProxy)
+
+	err := client.Subscribe(param)
+	assert.Nil(t, err)
+	assert.True(t, client.serviceInfoHolder.IsSubscribed(util.GetGroupName("svc-restore", "g"), ""))
+
+	mockProxy.unsubscribeErr = errors.New("server rejected unsubscribe")
+	err = client.Unsubscribe(param)
+	assert.Error(t, err)
+	assert.True(t, mockProxy.unsubscribeCalled)
+	assert.True(t, client.serviceInfoHolder.IsSubscribed(util.GetGroupName("svc-restore", "g"), ""),
+		"callback must be restored when the server-side unsubscribe fails")
 }
