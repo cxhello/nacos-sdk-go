@@ -31,3 +31,13 @@ type FuzzyWatchChangeEvent struct {
 	ChangedType string
 	SyncType    string
 }
+
+// FuzzyWatchLoadEvent is delivered to a load-event callback when the server
+// reports that a fuzzy watch pattern hit a capacity limit (pattern count or
+// matched-service count). Pattern is the groupKeyPattern that was rejected,
+// and ErrorCode is one of constant.ERROR_CODE_FUZZY_WATCH_PATTERN_OVER_LIMIT
+// or ERROR_CODE_FUZZY_WATCH_MATCH_COUNT_OVER_LIMIT.
+type FuzzyWatchLoadEvent struct {
+	Pattern   string
+	ErrorCode int
+}

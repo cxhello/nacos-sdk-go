@@ -78,4 +78,27 @@ const (
 	// https://github.com/alibaba/nacos/blob/develop/api/src/main/java/com/alibaba/nacos/api/naming/utils/NamingUtils.java#L73-L79
 	// Constants.SERVICE_INFO_SPLITER = "@@":
 	// https://github.com/alibaba/nacos/blob/develop/api/src/main/java/com/alibaba/nacos/api/common/Constants.java#L197
+
+	// ERROR_CODE_FUZZY_WATCH_PATTERN_OVER_LIMIT is returned by the server when
+	// the fuzzy watch pattern count reaches the configured limit, signaling
+	// the reconcile worker to suppress further pattern additions and notify
+	// any load-event callback.
+	// Source: com.alibaba.nacos.api.model.v2.ErrorCode.FUZZY_WATCH_PATTERN_OVER_LIMIT
+	// https://github.com/alibaba/nacos/blob/develop/api/src/main/java/com/alibaba/nacos/api/model/v2/ErrorCode.java#L49
+	ERROR_CODE_FUZZY_WATCH_PATTERN_OVER_LIMIT = 50310
+
+	// ERROR_CODE_FUZZY_WATCH_MATCH_COUNT_OVER_LIMIT is returned by the server when
+	// a fuzzy watch pattern matches more services than the configured limit,
+	// signaling the reconcile worker to suppress that pattern and notify any
+	// load-event callback.
+	// Source: com.alibaba.nacos.api.model.v2.ErrorCode.FUZZY_WATCH_MATCH_COUNT_OVER_LIMIT
+	// https://github.com/alibaba/nacos/blob/develop/api/src/main/java/com/alibaba/nacos/api/model/v2/ErrorCode.java#L50
+	ERROR_CODE_FUZZY_WATCH_MATCH_COUNT_OVER_LIMIT = 50311
+
+	// ABILITY_KEY_SERVER_FUZZY_WATCH is the server ability the naming module
+	// checks in SetupAckRequest to determine if the connected server supports
+	// fuzzy watch (3.x+) or only exact watch (2.x).
+	// Source: AbilityKey.SERVER_FUZZY_WATCH
+	// https://github.com/alibaba/nacos/blob/develop/api/src/main/java/com/alibaba/nacos/api/ability/AbilityKey.java#L40
+	ABILITY_KEY_SERVER_FUZZY_WATCH = "fuzzyWatch"
 )
