@@ -129,6 +129,27 @@ func (r *RpcClient) SetCurrentConnection(conn IConnection) {
 	r.currentConnection.Store(conn)
 }
 
+// IsAbilitySupportedByServer reports whether the current server connection
+// advertises abilityKey. The table arrives asynchronously via SetupAckRequest
+// shortly after connect, so poll up to timeout for it (Java parity:
+// RecAbilityContext waits similarly). A server that never sends SetupAck
+// (pre-2.2) times out to false, which is the correct answer for every
+// ability gated this way.
+func (r *RpcClient) IsAbilitySupportedByServer(abilityKey string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if conn := r.GetCurrentConnection(); conn != nil {
+			if table, ok := conn.getAbilityTable(); ok {
+				return table[abilityKey]
+			}
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 type ServerRequestHandlerMapping struct {
 	serverRequest func() rpc_request.IRequest
 	handler       IServerRequestHandler
@@ -392,6 +413,13 @@ func (r *RpcClient) registerServerRequestHandlers() {
 	r.RegisterServerRequestHandler(func() rpc_request.IRequest {
 		return &rpc_request.ClientDetectionRequest{InternalRequest: rpc_request.NewInternalRequest()}
 	}, &ClientDetectionRequestHandler{})
+
+	// register SetupAckRequestHandler: acks the server's ability-table push
+	// (the table itself is stored in handleServerRequest, which sees the
+	// receiving connection).
+	r.RegisterServerRequestHandler(func() rpc_request.IRequest {
+		return &rpc_request.SetupAckRequest{InternalRequest: rpc_request.NewInternalRequest()}
+	}, &SetupAckRequestHandler{})
 }
 
 func (r *RpcClient) Shutdown() {

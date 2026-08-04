@@ -129,7 +129,7 @@ func adaptBaseResponse(resultCode, errorCode int32, message, requestId string, b
 func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.IRequest, bool) {
 	switch payload.GetMetadata().GetType() {
 	case "ConnectResetRequest", "ClientDetectionRequest", "NotifySubscriberRequest",
-		"NamingFuzzyWatchSyncRequest", "NamingFuzzyWatchChangeNotifyRequest":
+		"NamingFuzzyWatchSyncRequest", "NamingFuzzyWatchChangeNotifyRequest", "SetupAckRequest":
 	default:
 		return nil, false
 	}
@@ -183,6 +183,13 @@ func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.
 			ServiceKey:  m.ServiceKey,
 			ChangedType: m.ChangedType,
 		}
+		return req, true
+	case *common.SetupAckRequest:
+		req := &rpc_request.SetupAckRequest{
+			InternalRequest: rpc_request.NewInternalRequest(),
+			AbilityTable:    m.AbilityTable,
+		}
+		req.RequestId = m.RequestId
 		return req, true
 	}
 	return nil, false
