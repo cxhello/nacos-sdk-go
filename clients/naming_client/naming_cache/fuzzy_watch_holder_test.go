@@ -17,8 +17,10 @@
 package naming_cache
 
 import (
+	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -462,6 +464,91 @@ func TestSyncTypeIsResourceChangedOnChangeNotify(t *testing.T) {
 
 	waitForEvents(t, sink, 1)
 	assert.Equal(t, constant.FUZZY_WATCH_RESOURCE_CHANGED, sink.snapshot()[0].SyncType)
+}
+
+// waitFor polls cond until it returns true, failing the test if it never
+// does within the deadline. Unlike waitForEvents (which is tied to
+// eventSink), this is a general-purpose poll used by the dispatcher
+// hardening tests below.
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met within 2s")
+}
+
+// TestCallbackPanicIsIsolated asserts that a panicking watcher callback
+// cannot starve or block delivery to the other watchers on the same
+// pattern: safeInvoke must recover the panic and let drain continue to the
+// next target.
+func TestCallbackPanicIsIsolated(t *testing.T) {
+	h := NewFuzzyWatchServiceListHolder("public")
+	h.RegisterPattern("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) { panic("boom") })
+	got := make(chan model.FuzzyWatchChangeEvent, 1)
+	h.RegisterPattern("public>>g>>svc*", func(ev model.FuzzyWatchChangeEvent) { got <- ev })
+	h.HandleSync("public>>g>>svc*", constant.FUZZY_WATCH_INIT_NOTIFY,
+		[]rpc_request.NamingFuzzyWatchSyncContext{{ServiceKey: "public@@g@@svc1", ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE}}, 1, 1)
+	select {
+	case ev := <-got:
+		assert.Equal(t, "svc1", ev.ServiceName)
+	case <-time.After(2 * time.Second):
+		t.Fatal("second callback starved by panicking first callback")
+	}
+}
+
+// TestPendingQueueIsBounded asserts that the per-pattern dispatch queue does
+// not grow without bound when a callback stalls the drain goroutine: once
+// pendingLimit is reached, further notifications are dropped (logged, not
+// panicked) while receivedGroupKeys - which is updated independently of
+// dispatch - stays complete. The dropped notifications are expected to be
+// re-delivered later by the reconcile worker's diff-sync, which is outside
+// this test's scope.
+func TestPendingQueueIsBounded(t *testing.T) {
+	h := NewFuzzyWatchServiceListHolder("public")
+	h.pendingLimitForTest(1)
+	block := make(chan struct{})
+	h.RegisterPattern("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) { <-block })
+	for i := 0; i < 50; i++ {
+		key := fmt.Sprintf("public@@g@@svc%d", i)
+		h.HandleChangeNotify(key, constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	}
+	ctx, _ := h.get("public>>g>>svc*")
+	ctx.mu.Lock()
+	pendingLen := len(ctx.pending)
+	ctx.mu.Unlock()
+	assert.LessOrEqual(t, pendingLen, 1, "pending must not grow past the bound")
+	assert.Len(t, h.ReceivedGroupKeys("public>>g>>svc*"), 50, "state must be complete even when notifications drop")
+	close(block)
+}
+
+// TestDeliverySkipsPerWatcherDuplicates asserts that deliver's per-watcher
+// skip decision is driven by each watcher's own syncedKeys, not just
+// pattern-level receivedGroupKeys: a manually queued duplicate ADD task
+// (simulating a diff-sync racing a live push) must be skipped for a watcher
+// that has already seen the key.
+func TestDeliverySkipsPerWatcherDuplicates(t *testing.T) {
+	h := NewFuzzyWatchServiceListHolder("public")
+	var count atomic.Int32
+	h.RegisterPattern("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) { count.Add(1) })
+	h.HandleChangeNotify("public@@g@@svc1", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	waitFor(t, func() bool { return count.Load() == 1 })
+	ctx, _ := h.get("public>>g>>svc*")
+	// Manually construct a duplicate ADD task (simulating a duplicate
+	// produced by diff-sync racing a live push): deliver must skip it per
+	// the target watcher's syncedKeys.
+	ctx.mu.Lock()
+	entries := append([]*watcherEntry(nil), ctx.entries...)
+	ev := model.FuzzyWatchChangeEvent{ServiceName: "svc1", GroupName: "g", NamespaceId: "public",
+		ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, SyncType: constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY}
+	ctx.enqueueLocked(notifyTask{event: &ev, targets: entries})
+	ctx.mu.Unlock()
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, int32(1), count.Load(), "duplicate ADD must be skipped per watcher")
 }
 
 func TestHolderRemoveCallbackByIDAndPattern(t *testing.T) {
