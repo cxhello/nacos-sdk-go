@@ -213,16 +213,6 @@ func (proxy *NamingHttpProxy) Unsubscribe(serviceName, groupName, clusters strin
 	return nil
 }
 
-// FuzzyWatch is not supported over HTTP; fuzzy watch is a gRPC-only feature.
-func (proxy *NamingHttpProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
-	return errors.New("FuzzyWatch is not supported by the naming http proxy, it requires a gRPC connection")
-}
-
-// CancelFuzzyWatch is not supported over HTTP; fuzzy watch is a gRPC-only feature.
-func (proxy *NamingHttpProxy) CancelFuzzyWatch(groupKeyPattern string) error {
-	return errors.New("CancelFuzzyWatch is not supported by the naming http proxy, it requires a gRPC connection")
-}
-
 func (proxy *NamingHttpProxy) CloseClient() {
 
 }

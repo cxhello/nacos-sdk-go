@@ -33,7 +33,7 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 )
 
-// watcherEntry pairs a user callback with the id RegisterPattern handed back
+// watcherEntry pairs a user callback with the id RegisterWatcher handed back
 // to its caller, plus the per-watcher delivery state: syncedKeys is this
 // watcher's own view of which serviceKeys it has been told ADD (so a
 // duplicate ADD task - e.g. one that raced a diff-sync against a live push -
@@ -138,7 +138,7 @@ type fuzzyWatchContext struct {
 	// held: it must be non-blocking and must not re-enter the holder or take
 	// any holder/context lock (h.mu, or any fuzzyWatchContext's mu including
 	// this one) - taking ctx.mu recursively self-deadlocks, and taking h.mu
-	// inverts the holder's h.mu -> ctx.mu lock order (see RegisterPattern).
+	// inverts the holder's h.mu -> ctx.mu lock order (see RegisterWatcher).
 	// newFuzzyWatchContext wires this to h.Bell, which satisfies the contract:
 	// a non-blocking channel send that touches no lock.
 	onDrop func()
@@ -325,7 +325,7 @@ type FuzzyWatchServiceListHolder struct {
 	patterns  cache.ConcurrentMap // groupKeyPattern -> *fuzzyWatchContext
 	mu        sync.Mutex          // serializes pattern create/remove
 
-	// nextCallbackID is an atomic counter handed out by RegisterPattern so
+	// nextCallbackID is an atomic counter handed out by RegisterWatcher so
 	// every registration - even a repeat registration of the same func
 	// value - gets its own identity to cancel by. atomic.Uint64 (rather than
 	// a plain uint64 used with atomic.AddUint64) keeps its own alignment
@@ -379,7 +379,7 @@ func NewFuzzyWatchServiceListHolder(namespace string) *FuzzyWatchServiceListHold
 }
 
 // pendingLimitForTest tightens the per-pattern dispatch queue bound; existing
-// contexts are not retrofitted, so call it before RegisterPattern.
+// contexts are not retrofitted, so call it before RegisterWatcher.
 func (h *FuzzyWatchServiceListHolder) pendingLimitForTest(n int) { h.pendingLimit = n }
 
 func (h *FuzzyWatchServiceListHolder) get(pattern string) (*fuzzyWatchContext, bool) {
@@ -388,151 +388,6 @@ func (h *FuzzyWatchServiceListHolder) get(pattern string) (*fuzzyWatchContext, b
 		return nil, false
 	}
 	return v.(*fuzzyWatchContext), true
-}
-
-// RegisterPattern records a callback for pattern, creating the pattern
-// context if needed, and returns the id assigned to this registration plus
-// whether the pattern context was newly created. Registration is
-// unconditional - no code-pointer dedupe - so registering the same func
-// value twice yields two ids and two independent deliveries per event,
-// matching the Java client where two distinct watcher objects both fire.
-// Callers that must avoid duplicate delivery are responsible for tracking
-// the returned id and not registering twice.
-//
-// If pattern already has known matched services (created is false and the
-// pattern's initial sync has already delivered some), the new watcher alone
-// is replayed those services as ADD_SERVICE events before this call returns
-// - see the replay block below. Every other, already-registered watcher on
-// the same pattern is unaffected.
-//
-// h.mu is held across both the pattern lookup/create and the entry append
-// below, nesting ctx.mu inside it, so a concurrent RemovePattern can never
-// evict the context between "found/created it" and "appended the entry to
-// it". Without that, RegisterPattern could append to a context it just
-// evicted a moment earlier and report success for a registration that will
-// never receive an event. Lock order is always h.mu -> ctx.mu: drain() and
-// the Handle* methods take ctx.mu but never acquire h.mu while holding it,
-// so this nesting cannot deadlock.
-func (h *FuzzyWatchServiceListHolder) RegisterPattern(pattern string, cb func(model.FuzzyWatchChangeEvent)) (id uint64, created bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	var ctx *fuzzyWatchContext
-	if v, ok := h.patterns.Get(pattern); ok {
-		ctx = v.(*fuzzyWatchContext)
-	} else {
-		ctx = newFuzzyWatchContext(pattern, h)
-		h.patterns.Set(pattern, ctx)
-		created = true
-	}
-
-	id = h.nextCallbackID.Add(1)
-	ctx.mu.Lock()
-	entry := &watcherEntry{
-		id:          id,
-		fn:          cb,
-		syncedKeys:  make(map[string]struct{}),
-		syncVersion: ctx.syncVersion,
-	}
-	ctx.entries = append(ctx.entries, entry)
-
-	// Java parity (NamingFuzzyWatchServiceListHolder#registerFuzzyWatcher):
-	// replay the currently known matched services to the NEW watcher only, as
-	// ADD_SERVICE events with FUZZY_WATCH_INIT_NOTIFY sync type, so a
-	// late-joining watcher on an already-synced pattern still learns the
-	// existing match set instead of waiting for the next server push. For a
-	// brand-new pattern receivedGroupKeys is empty, so this is a no-op.
-	replay := make([]notifyTask, 0, len(ctx.receivedGroupKeys))
-	for serviceKey := range ctx.receivedGroupKeys {
-		namespace, group, service, err := parseServiceKey(serviceKey)
-		if err != nil {
-			continue
-		}
-		ev := model.FuzzyWatchChangeEvent{
-			ServiceName: service, GroupName: group, NamespaceId: namespace,
-			ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE,
-			SyncType:    constant.FUZZY_WATCH_INIT_NOTIFY,
-		}
-		replay = append(replay, notifyTask{event: &ev, targets: []*watcherEntry{entry}})
-	}
-	ctx.enqueueLocked(replay...)
-	ctx.mu.Unlock()
-	return id, created
-}
-
-// RemoveCallbackByID drops exactly the registration identified by id from
-// pattern, leaving any other registrations on the same pattern untouched.
-// It's exported for naming_client's registration-rollback path: if
-// RegisterPattern succeeds locally but the follow-up server-side FuzzyWatch
-// RPC fails, the caller undoes only the registration it just made instead of
-// tearing down the whole pattern (which may have other, unrelated
-// registrations). A no-op if pattern or id is unknown.
-//
-// Removal only stops future dispatch: it does not reach into notifyTasks
-// already queued or already snapshotted into a task's targets slice
-// (snapshotEntriesLocked is called under ctx.mu before enqueueLocked, so a
-// task already built holds its own copy). A registration removed here may
-// therefore still receive one or more events that were snapshotted before
-// the removal took effect.
-func (h *FuzzyWatchServiceListHolder) RemoveCallbackByID(pattern string, id uint64) {
-	ctx, ok := h.get(pattern)
-	if !ok {
-		return
-	}
-	ctx.mu.Lock()
-	defer ctx.mu.Unlock()
-	kept := ctx.entries[:0:0]
-	for _, existing := range ctx.entries {
-		if existing.id != id {
-			kept = append(kept, existing)
-		}
-	}
-	ctx.entries = kept
-}
-
-// RemovePatternIfEmpty removes pattern only if it currently has no
-// registered callbacks. It mirrors Java
-// NamingFuzzyWatchServiceListHolder#removePatternMatchCache's
-// watchers.isEmpty() gate, and exists for naming_client's registration
-// rollback path: a caller whose own FuzzyWatch RPC failed must undo its own
-// registration but can never be allowed to tear down a pattern that a
-// concurrent, successful FuzzyWatch call already populated with its own
-// callback while this caller's RPC was still in flight - unconditionally
-// calling RemovePattern here would wipe that other caller's callback and
-// receivedGroupKeys, leaving a server-side watch with no local pattern to
-// match pushes against.
-//
-// Lock order is h.mu -> ctx.mu, same as RegisterPattern (see the comment
-// there): h.mu is held across the lookup and the ctx.mu-guarded emptiness
-// check, so a concurrent RegisterPattern cannot append a callback to ctx
-// between this check and the removal.
-func (h *FuzzyWatchServiceListHolder) RemovePatternIfEmpty(pattern string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	ctx, ok := h.get(pattern)
-	if !ok {
-		return
-	}
-	ctx.mu.Lock()
-	empty := len(ctx.entries) == 0
-	ctx.mu.Unlock()
-	if empty {
-		h.patterns.Remove(pattern)
-	}
-}
-
-// RemovePattern forgets a pattern entirely (its keys and callbacks). This
-// only stops new work: it drops the context from the map so no future
-// HandleSync/HandleChangeNotify can enqueue onto it, but it does not stop a
-// drain goroutine already running against that context's own pending queue.
-// Any notifyTasks enqueued before the removal keep being delivered to their
-// snapshotted targets until that queue drains empty - a bounded amount of
-// late delivery (only what was already queued), never an unbounded one,
-// since removal guarantees nothing more is added after it runs.
-func (h *FuzzyWatchServiceListHolder) RemovePattern(pattern string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.patterns.Remove(pattern)
 }
 
 // Patterns returns the currently registered groupKeyPatterns.

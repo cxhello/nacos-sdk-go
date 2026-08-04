@@ -38,11 +38,5 @@ type INamingProxy interface {
 
 	Unsubscribe(serviceName, groupName, clusters string) error
 
-	// FuzzyWatch (re)registers a fuzzy watch on groupKeyPattern. gRPC-only.
-	FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error
-
-	// CancelFuzzyWatch tears down a fuzzy watch on groupKeyPattern. gRPC-only.
-	CancelFuzzyWatch(groupKeyPattern string) error
-
 	CloseClient()
 }

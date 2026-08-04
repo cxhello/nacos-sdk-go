@@ -32,7 +32,6 @@ type ConnectionEventListener struct {
 	clientProxy              naming_proxy.INamingProxy
 	registeredInstanceCached cache.ConcurrentMap
 	subscribes               cache.ConcurrentMap
-	fuzzyWatchPatterns       cache.ConcurrentMap
 }
 
 func NewConnectionEventListener(clientProxy naming_proxy.INamingProxy) *ConnectionEventListener {
@@ -40,18 +39,24 @@ func NewConnectionEventListener(clientProxy naming_proxy.INamingProxy) *Connecti
 		clientProxy:              clientProxy,
 		registeredInstanceCached: cache.NewConcurrentMap(),
 		subscribes:               cache.NewConcurrentMap(),
-		fuzzyWatchPatterns:       cache.NewConcurrentMap(),
 	}
 }
 
 func (c *ConnectionEventListener) OnConnected() {
 	c.redoSubscribe()
 	c.redoRegisterEachService()
-	c.redoFuzzyWatch()
+	if grpcProxy, ok := c.clientProxy.(*NamingGrpcProxy); ok {
+		// speed up fuzzy watch convergence; the reconcile worker re-sends
+		// every inconsistent pattern
+		grpcProxy.fuzzyWatchHolder.Bell()
+	}
 }
 
 func (c *ConnectionEventListener) OnDisConnect() {
-
+	if grpcProxy, ok := c.clientProxy.(*NamingGrpcProxy); ok {
+		// every pattern must be re-synced on the next connection
+		grpcProxy.fuzzyWatchHolder.ResetConsistenceStatus()
+	}
 }
 
 func (c *ConnectionEventListener) redoSubscribe() {
@@ -128,32 +133,6 @@ func (c *ConnectionEventListener) GetBatchInstancesForRedo(serviceName, groupNam
 	}
 	instances, ok := v.([]model.Instance)
 	return instances, ok
-}
-
-// redoFuzzyWatch re-registers each watched pattern after a reconnect. It re-sends
-// with isInitializing=false and the holder's current receivedGroupKeys so the
-// server replies with a diff against what the client already knows, rather than
-// a full re-init.
-func (c *ConnectionEventListener) redoFuzzyWatch() {
-	grpcProxy, ok := c.clientProxy.(*NamingGrpcProxy)
-	if !ok {
-		logger.Error("redo fuzzy watch clientProxy type error")
-		return
-	}
-	for _, pattern := range c.fuzzyWatchPatterns.Keys() {
-		receivedGroupKeys := grpcProxy.fuzzyWatchHolder.ReceivedGroupKeys(pattern)
-		if err := grpcProxy.FuzzyWatch(pattern, receivedGroupKeys, false); err != nil {
-			logger.Warnf("redo fuzzy watch pattern:%s failed:%+v", pattern, err)
-		}
-	}
-}
-
-func (c *ConnectionEventListener) CacheFuzzyWatchForRedo(groupKeyPattern string) {
-	c.fuzzyWatchPatterns.Set(groupKeyPattern, struct{}{})
-}
-
-func (c *ConnectionEventListener) RemoveFuzzyWatchForRedo(groupKeyPattern string) {
-	c.fuzzyWatchPatterns.Remove(groupKeyPattern)
 }
 
 func (c *ConnectionEventListener) CacheSubscriberForRedo(fullServiceName, clusters string) {

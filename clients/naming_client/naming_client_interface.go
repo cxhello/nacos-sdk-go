@@ -109,25 +109,17 @@ type INamingClient interface {
 	// SubscribeCallback require
 	Unsubscribe(param *vo.SubscribeParam) error
 
-	// FuzzyWatch use to watch add/delete of services matching a pattern
+	// FuzzyWatch use to watch add/delete of services matching a pattern.
+	// Registration is local: the returned handle's server-side watch is
+	// established and kept in sync by a background reconcile worker, so an
+	// error here reflects only parameter validation or missing server
+	// capability, never a transient RPC outcome. Cancel the watch with
+	// handle.Cancel(); it is scoped to this registration only.
 	// ServiceNamePattern require, supports five modes: exact ("order"),
 	//   match-all ("*"), prefix ("order*"), suffix ("*order"), contains ("*order*")
 	// GroupNamePattern optional,default:DEFAULT_GROUP
 	// WatchCallback require
-	// An error return means the watch was not established and the local
-	// registration was rolled back; however, on an already-watched pattern
-	// with existing matches, the callback may already have been invoked with
-	// initial replay events queued before the failure was known - the
-	// rollback only guarantees no event enqueued after it runs is delivered.
-	FuzzyWatch(param *vo.FuzzyWatchParam) error
-
-	// CancelFuzzyWatch use to cancel a fuzzy watch. Cancellation is scoped to
-	// the whole pattern - every callback registered for it, and the
-	// server-side watch - not to param.WatchCallback, which is therefore not
-	// required and may be left nil.
-	// ServiceNamePattern require
-	// GroupNamePattern optional,default:DEFAULT_GROUP
-	CancelFuzzyWatch(param *vo.FuzzyWatchParam) error
+	FuzzyWatch(param *vo.FuzzyWatchParam) (*FuzzyWatchHandle, error)
 
 	// GetAllServicesInfo use to get all service info by page
 	GetAllServicesInfo(param vo.GetAllServiceInfoParam) (model.ServiceList, error)

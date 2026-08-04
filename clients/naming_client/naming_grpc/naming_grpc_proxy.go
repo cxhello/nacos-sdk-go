@@ -37,6 +37,8 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
 )
 
+var _ naming_cache.FuzzyWatchRequester = (*NamingGrpcProxy)(nil)
+
 // NamingGrpcProxy ...
 type NamingGrpcProxy struct {
 	clientConfig      constant.ClientConfig
@@ -338,63 +340,33 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 	return err
 }
 
-// FuzzyWatch (re)registers a fuzzy watch on groupKeyPattern. receivedGroupKeys
-// is the client's current known match set (empty on first watch, the holder's
-// set on redo); isInitializing is true only for the first watch, telling the
-// server to send a full INIT sync rather than a diff.
-func (proxy *NamingGrpcProxy) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
-	logger.Infof("fuzzy watch namespaceId:<%s>, pattern:<%s>, isInitializing:<%t>",
-		proxy.clientConfig.NamespaceId, groupKeyPattern, isInitializing)
+// SendFuzzyWatchRequest sends one WATCH/CANCEL_WATCH request on behalf of the
+// reconcile worker. A non-success reply keeps its server errorCode via
+// *naming_cache.FuzzyWatchServerError so the worker can tell capacity
+// rejections from transient failures.
+func (proxy *NamingGrpcProxy) SendFuzzyWatchRequest(groupKeyPattern, watchType string, receivedGroupKeys []string, isInitializing bool) error {
+	logger.Infof("fuzzy watch namespaceId:<%s>, pattern:<%s>, watchType:<%s>, isInitializing:<%t>",
+		proxy.clientConfig.NamespaceId, groupKeyPattern, watchType, isInitializing)
 	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
-		constant.FUZZY_WATCH_TYPE_WATCH, receivedGroupKeys, isInitializing)
-	if err := proxy.sendFuzzyWatch(request, groupKeyPattern); err != nil {
-		return err
-	}
-	// Cache for redo only once the server has actually accepted the watch:
-	// caching before send would leave a stale redo entry - and a reconnect
-	// that resubscribes a pattern the server never agreed to watch - behind a
-	// failed RPC. Accepted trade-off: if the connection dies while the send
-	// is in flight (accepted server-side but the reply never arrives, or lost
-	// mid-transit), the pattern is not yet in the redo cache, so a reconnect
-	// in that window will not re-watch it until the caller retries - this
-	// leaves no residue on failure, at the cost of not auto-recovering that
-	// narrow race.
-	proxy.eventListener.CacheFuzzyWatchForRedo(groupKeyPattern)
-	return nil
-}
-
-// CancelFuzzyWatch tears down a fuzzy watch on groupKeyPattern (watchType
-// CANCEL_WATCH) and removes it from the redo cache.
-func (proxy *NamingGrpcProxy) CancelFuzzyWatch(groupKeyPattern string) error {
-	logger.Infof("cancel fuzzy watch namespaceId:<%s>, pattern:<%s>", proxy.clientConfig.NamespaceId, groupKeyPattern)
-	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
-		constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, nil, false)
-	if err := proxy.sendFuzzyWatch(request, groupKeyPattern); err != nil {
-		return err
-	}
-	// Only drop the redo entry once the server has confirmed the cancel: if
-	// the RPC failed the server still thinks the watch is active, so a
-	// reconnect must keep re-registering it rather than silently dropping it.
-	proxy.eventListener.RemoveFuzzyWatchForRedo(groupKeyPattern)
-	return nil
-}
-
-// sendFuzzyWatch sends a fuzzy watch request and surfaces a non-success server
-// reply (e.g. a 2.x server that does not understand the request) as an error
-// rather than swallowing it.
-func (proxy *NamingGrpcProxy) sendFuzzyWatch(request *rpc_request.NamingFuzzyWatchRequest, groupKeyPattern string) error {
+		watchType, receivedGroupKeys, isInitializing)
 	response, err := proxy.send(request)
 	if err != nil {
 		return err
 	}
 	if response == nil {
-		return errors.Errorf("fuzzy watch pattern:%s watchType:%s got nil response", groupKeyPattern, request.WatchType)
+		return errors.Errorf("fuzzy watch pattern:%s watchType:%s got nil response", groupKeyPattern, watchType)
 	}
 	if !response.IsSuccess() {
-		return errors.Errorf("fuzzy watch pattern:%s watchType:%s failed, resultCode:%d message:%s",
-			groupKeyPattern, request.WatchType, response.GetResultCode(), response.GetMessage())
+		return &naming_cache.FuzzyWatchServerError{ErrorCode: response.GetErrorCode(), Message: response.GetMessage()}
 	}
 	return nil
+}
+
+// ServerSupportsFuzzyWatch reports whether the connected server advertises
+// the fuzzyWatch ability (3.x servers). Bounded wait covers the window where
+// the SetupAck push has not landed yet right after (re)connect.
+func (proxy *NamingGrpcProxy) ServerSupportsFuzzyWatch() bool {
+	return proxy.rpcClient.GetRpcClient().IsAbilitySupportedByServer(constant.ABILITY_KEY_SERVER_FUZZY_WATCH, 2*time.Second)
 }
 
 func (proxy *NamingGrpcProxy) CloseClient() {

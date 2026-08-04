@@ -24,6 +24,7 @@ import (
 	reflect "reflect"
 
 	gomock "github.com/golang/mock/gomock"
+	naming_client "github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client"
 	model "github.com/nacos-group/nacos-sdk-go/v3/model"
 	vo "github.com/nacos-group/nacos-sdk-go/v3/vo"
 )
@@ -141,31 +142,18 @@ func (mr *MockINamingClientMockRecorder) Subscribe(param interface{}) *gomock.Ca
 }
 
 // FuzzyWatch mocks base method
-func (m *MockINamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) error {
+func (m *MockINamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) (*naming_client.FuzzyWatchHandle, error) {
 	m.ctrl.T.Helper()
 	ret := m.ctrl.Call(m, "FuzzyWatch", param)
-	ret0, _ := ret[0].(error)
-	return ret0
+	ret0, _ := ret[0].(*naming_client.FuzzyWatchHandle)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
 }
 
 // FuzzyWatch indicates an expected call of FuzzyWatch
 func (mr *MockINamingClientMockRecorder) FuzzyWatch(param interface{}) *gomock.Call {
 	mr.mock.ctrl.T.Helper()
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "FuzzyWatch", reflect.TypeOf((*MockINamingClient)(nil).FuzzyWatch), param)
-}
-
-// CancelFuzzyWatch mocks base method
-func (m *MockINamingClient) CancelFuzzyWatch(param *vo.FuzzyWatchParam) error {
-	m.ctrl.T.Helper()
-	ret := m.ctrl.Call(m, "CancelFuzzyWatch", param)
-	ret0, _ := ret[0].(error)
-	return ret0
-}
-
-// CancelFuzzyWatch indicates an expected call of CancelFuzzyWatch
-func (mr *MockINamingClientMockRecorder) CancelFuzzyWatch(param interface{}) *gomock.Call {
-	mr.mock.ctrl.T.Helper()
-	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "CancelFuzzyWatch", reflect.TypeOf((*MockINamingClient)(nil).CancelFuzzyWatch), param)
 }
 
 // Unsubscribe mocks base method

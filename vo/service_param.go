@@ -105,6 +105,6 @@ type SelectOneHealthInstanceParam struct {
 type FuzzyWatchParam struct {
 	ServiceNamePattern string                                  `param:"serviceNamePattern"` //required
 	GroupNamePattern   string                                  `param:"groupNamePattern"`   //optional,default:DEFAULT_GROUP
-	WatchCallback      func(event model.FuzzyWatchChangeEvent) //required for FuzzyWatch; ignored (may be nil) for CancelFuzzyWatch, which cancels the whole pattern
+	WatchCallback      func(event model.FuzzyWatchChangeEvent) //required; fires on every add/delete for a matched service
 	OnLoadEvent        func(event model.FuzzyWatchLoadEvent)   //optional; called when the server reports the pattern hit a capacity limit (pattern count / matched-service count). nil means the rejection is only logged.
 }

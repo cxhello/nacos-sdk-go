@@ -404,71 +404,28 @@ func (sc *NamingClient) Unsubscribe(param *vo.SubscribeParam) (err error) {
 	return err
 }
 
-// FuzzyWatch registers a fuzzy watch that fires the callback whenever a service
-// whose name/group match the given patterns is added or deleted.
-//
-// An error return means the watch was not established and the local
-// registration made by this call was rolled back. That rollback is racy with
-// respect to delivery, not with respect to state: RegisterPattern enqueues
-// any initial replay of already-known matched services before the server RPC
-// outcome is known, so on an already-watched pattern with existing matches,
-// this call's callback may already have been invoked with replay events by
-// the time the error is returned. No event enqueued after the rollback runs
-// will reach it.
-func (sc *NamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) error {
+// FuzzyWatch registers a fuzzy watch on services matching the given patterns
+// and returns a handle identifying this registration. Registration is a
+// local operation: the server-side watch is established and maintained by a
+// background reconcile worker, so the returned error only reflects parameter
+// validation and server capability - never a transient RPC outcome. Capacity
+// rejections from the server are delivered through param.OnLoadEvent.
+func (sc *NamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) (*FuzzyWatchHandle, error) {
 	if param.ServiceNamePattern == "" {
-		return errors.New("serviceNamePattern cannot be empty!")
+		return nil, errors.New("serviceNamePattern cannot be empty!")
 	}
 	if len(param.GroupNamePattern) == 0 {
 		param.GroupNamePattern = constant.DEFAULT_GROUP
 	}
 	if param.WatchCallback == nil {
-		return errors.New("watchCallback cannot be nil!")
+		return nil, errors.New("watchCallback cannot be nil!")
 	}
 	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
-	// created tells the proxy whether this is the pattern's first watcher
-	// (needs a full INIT sync from the server) or an additional watcher on an
-	// already-synced pattern (only needs a diff against what's already
-	// known).
-	id, created := sc.fuzzyWatchHolder.RegisterPattern(pattern, param.WatchCallback)
-	err := sc.serviceProxy.FuzzyWatch(pattern, sc.fuzzyWatchHolder.ReceivedGroupKeys(pattern), created)
+	id, err := sc.fuzzyWatchHolder.RegisterWatcher(pattern, param.WatchCallback, param.OnLoadEvent)
 	if err != nil {
-		// A failed registration must not leave local state behind, but must
-		// undo only what THIS call added. `created` is a snapshot from
-		// before the RPC; while it was in flight, a concurrent FuzzyWatch
-		// call on the same pattern may have succeeded and added its own
-		// callback. Branching on `created` here (remove-whole-pattern vs.
-		// remove-just-this-callback) would let this rollback delete that
-		// other caller's registration whenever it raced in ahead of the
-		// error. So the rollback is unconditional and order-safe instead:
-		// drop this callback by id, then remove the pattern only if that
-		// left it with no callbacks at all.
-		sc.fuzzyWatchHolder.RemoveCallbackByID(pattern, id)
-		sc.fuzzyWatchHolder.RemovePatternIfEmpty(pattern)
+		return nil, err
 	}
-	return err
-}
-
-// CancelFuzzyWatch cancels the fuzzy watch for the given pattern. Cancellation
-// is scoped to the whole pattern - every callback registered for it, and the
-// server-side watch - rather than to param.WatchCallback, so the callback is
-// not consulted and may be nil. Local state (the pattern's callbacks and
-// known keys) is only torn down once the server confirms the cancel; a
-// failed cancel RPC leaves it untouched so a reconnect keeps the watch alive
-// instead of silently dropping a watch the server still thinks is active.
-func (sc *NamingClient) CancelFuzzyWatch(param *vo.FuzzyWatchParam) error {
-	if param.ServiceNamePattern == "" {
-		return errors.New("serviceNamePattern cannot be empty!")
-	}
-	if len(param.GroupNamePattern) == 0 {
-		param.GroupNamePattern = constant.DEFAULT_GROUP
-	}
-	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
-	if err := sc.serviceProxy.CancelFuzzyWatch(pattern); err != nil {
-		return err
-	}
-	sc.fuzzyWatchHolder.RemovePattern(pattern)
-	return nil
+	return &FuzzyWatchHandle{holder: sc.fuzzyWatchHolder, pattern: pattern, id: id}, nil
 }
 
 // buildGroupKeyPattern joins the client's namespace with the group and service

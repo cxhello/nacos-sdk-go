@@ -134,8 +134,9 @@ func TestIntegrationNamingFuzzyWatch(t *testing.T) {
 		GroupNamePattern:   constant.DEFAULT_GROUP,
 		WatchCallback:      recorder.record,
 	}
-	require.NoError(t, watchClient.FuzzyWatch(fwParam), "fuzzy watch %s", pattern)
-	defer func() { _ = watchClient.CancelFuzzyWatch(fwParam) }()
+	handle, err := watchClient.FuzzyWatch(fwParam)
+	require.NoError(t, err, "fuzzy watch %s", pattern)
+	defer handle.Cancel()
 
 	// Register from an independent client, mirroring a separate service
 	// instance producing the change rather than the watcher itself.
@@ -205,7 +206,7 @@ func TestIntegrationNamingFuzzyWatch(t *testing.T) {
 // FuzzyWatch callback on the very same pattern must replay that already-known
 // match to the new callback alone, as an ADD_SERVICE event tagged
 // FUZZY_WATCH_INIT_NOTIFY (the locally generated replay, not a fresh server
-// batch sync) - see naming_cache.FuzzyWatchServiceListHolder.RegisterPattern.
+// batch sync) - see naming_cache.FuzzyWatchServiceListHolder.RegisterWatcher.
 func TestIntegrationNamingFuzzyWatchSecondWatcherReplay(t *testing.T) {
 	if !isNacosV3Admin(t) {
 		t.Skip("fuzzy watch requires nacos 3.x")
@@ -225,11 +226,11 @@ func TestIntegrationNamingFuzzyWatchSecondWatcherReplay(t *testing.T) {
 		GroupNamePattern:   constant.DEFAULT_GROUP,
 		WatchCallback:      watcher1.record,
 	}
-	require.NoError(t, watchClient.FuzzyWatch(fwParam1), "fuzzy watch %s (watcher1)", pattern)
-	// CancelFuzzyWatch is pattern-scoped (tears down every callback
-	// registered for the pattern, not just the one passed in), so a single
-	// deferred cancel at the end of the test retires both watchers.
-	defer func() { _ = watchClient.CancelFuzzyWatch(fwParam1) }()
+	handle1, err := watchClient.FuzzyWatch(fwParam1)
+	require.NoError(t, err, "fuzzy watch %s (watcher1)", pattern)
+	// Cancellation is watcher-scoped: each handle must be canceled on its own
+	// to fully retire the pattern.
+	defer handle1.Cancel()
 
 	regClient, err := clients.NewNamingClient(clientParam(t))
 	require.NoError(t, err, "create naming client for registration")
@@ -257,7 +258,7 @@ func TestIntegrationNamingFuzzyWatchSecondWatcherReplay(t *testing.T) {
 	}()
 
 	// Wait until watcher1 has actually observed the service. The pattern's
-	// shared receivedGroupKeys (what RegisterPattern replays to a late
+	// shared receivedGroupKeys (what RegisterWatcher replays to a late
 	// joiner) is updated synchronously as soon as the change is applied, but
 	// watcher1 receiving the callback is the only externally observable
 	// proof that has happened - so this is what makes watcher2's replay
@@ -273,7 +274,9 @@ func TestIntegrationNamingFuzzyWatchSecondWatcherReplay(t *testing.T) {
 		GroupNamePattern:   constant.DEFAULT_GROUP,
 		WatchCallback:      watcher2.record,
 	}
-	require.NoError(t, watchClient.FuzzyWatch(fwParam2), "fuzzy watch %s (watcher2)", pattern)
+	handle2, err := watchClient.FuzzyWatch(fwParam2)
+	require.NoError(t, err, "fuzzy watch %s (watcher2)", pattern)
+	defer handle2.Cancel()
 
 	// watcher2 is a late joiner on an already-synced pattern: it must be
 	// replayed the existing match as ADD_SERVICE/FUZZY_WATCH_INIT_NOTIFY
@@ -285,7 +288,7 @@ func TestIntegrationNamingFuzzyWatchSecondWatcherReplay(t *testing.T) {
 		"watcher2 should be replayed the existing match tagged FUZZY_WATCH_INIT_NOTIFY")
 
 	// watcher1 must not have been replayed a second time: the replay in
-	// RegisterPattern only targets the newly registered callback.
+	// RegisterWatcher only targets the newly registered callback.
 	watcher1Count := 0
 	for _, st := range watcher1.syncTypes() {
 		if st == constant.FUZZY_WATCH_INIT_NOTIFY {
@@ -298,11 +301,11 @@ func TestIntegrationNamingFuzzyWatchSecondWatcherReplay(t *testing.T) {
 	t.Logf("watcher2 syncTypes observed: %v", watcher2.syncTypes())
 }
 
-// TestIntegrationNamingFuzzyWatchCancelNoResurrection exercises the
-// pattern-scoped CancelFuzzyWatch semantics: once the cancel RPC has been
-// confirmed by the server, a brand-new service that matches the
-// now-canceled pattern must never resurrect it - the canceled callback must
-// receive nothing for it, ever, not just "not yet".
+// TestIntegrationNamingFuzzyWatchCancelNoResurrection exercises
+// handle.Cancel(): once the resulting server-side CANCEL has been confirmed,
+// a brand-new service that matches the now-canceled pattern must never
+// resurrect it - the canceled callback must receive nothing for it, ever,
+// not just "not yet".
 func TestIntegrationNamingFuzzyWatchCancelNoResurrection(t *testing.T) {
 	if !isNacosV3Admin(t) {
 		t.Skip("fuzzy watch requires nacos 3.x")
@@ -323,7 +326,8 @@ func TestIntegrationNamingFuzzyWatchCancelNoResurrection(t *testing.T) {
 		GroupNamePattern:   constant.DEFAULT_GROUP,
 		WatchCallback:      recorder.record,
 	}
-	require.NoError(t, watchClient.FuzzyWatch(fwParam), "fuzzy watch %s", pattern)
+	handle, err := watchClient.FuzzyWatch(fwParam)
+	require.NoError(t, err, "fuzzy watch %s", pattern)
 
 	regClient, err := clients.NewNamingClient(clientParam(t))
 	require.NoError(t, err, "create naming client for registration")
@@ -356,7 +360,7 @@ func TestIntegrationNamingFuzzyWatchCancelNoResurrection(t *testing.T) {
 		return found
 	}, waitTimeout, waitInterval, "watch should observe ADD_SERVICE before cancel")
 
-	require.NoError(t, watchClient.CancelFuzzyWatch(fwParam), "cancel fuzzy watch %s", pattern)
+	handle.Cancel()
 	preCancelCount := recorder.count()
 
 	// Register a brand-new matching service AFTER the cancel is confirmed.

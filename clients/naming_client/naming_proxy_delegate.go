@@ -76,6 +76,9 @@ func NewNamingProxyDelegateWithRamCredentialProvider(ctx context.Context, client
 		return nil, err
 	}
 
+	fuzzyWatchHolder.SetRequester(grpcClientProxy)
+	fuzzyWatchHolder.Start()
+
 	return &NamingProxyDelegate{
 		httpClientProxy:   httpClientProxy,
 		grpcClientProxy:   grpcClientProxy,
@@ -139,14 +142,7 @@ func (proxy *NamingProxyDelegate) Unsubscribe(serviceName, groupName, clusters s
 	return proxy.grpcClientProxy.Unsubscribe(serviceName, groupName, clusters)
 }
 
-func (proxy *NamingProxyDelegate) FuzzyWatch(groupKeyPattern string, receivedGroupKeys []string, isInitializing bool) error {
-	return proxy.grpcClientProxy.FuzzyWatch(groupKeyPattern, receivedGroupKeys, isInitializing)
-}
-
-func (proxy *NamingProxyDelegate) CancelFuzzyWatch(groupKeyPattern string) error {
-	return proxy.grpcClientProxy.CancelFuzzyWatch(groupKeyPattern)
-}
-
 func (proxy *NamingProxyDelegate) CloseClient() {
+	proxy.fuzzyWatchHolder.Shutdown()
 	proxy.grpcClientProxy.CloseClient()
 }
