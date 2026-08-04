@@ -45,6 +45,16 @@ type fakeRequester struct {
 	script    []error // popped per call; empty => nil
 	supported bool
 	sent      chan fuzzyCall
+
+	// blockCalls/release let a test pause SendFuzzyWatchRequest mid-flight -
+	// after the call is recorded and visible on sent (so mustWatchCall can
+	// observe it started), but before it returns - to deterministically
+	// interleave a desired-state mutation (RemoveWatcherByID,
+	// ResetConsistenceStatus, ...) with an in-flight RPC. blockCalls counts
+	// down per call; release is closed by the test to unblock exactly the
+	// calls it armed for blocking.
+	blockCalls int
+	release    chan struct{}
 }
 
 func newFakeRequester() *fakeRequester {
@@ -60,8 +70,16 @@ func (f *fakeRequester) SendFuzzyWatchRequest(pattern, watchType string, keys []
 		err = f.script[0]
 		f.script = f.script[1:]
 	}
+	var wait chan struct{}
+	if f.blockCalls > 0 {
+		f.blockCalls--
+		wait = f.release
+	}
 	f.mu.Unlock()
 	f.sent <- call
+	if wait != nil {
+		<-wait
+	}
 	return err
 }
 
@@ -219,4 +237,169 @@ func TestRegisterFailsFastWhenAbilityMissing(t *testing.T) {
 	assert.ErrorIs(t, err, ErrFuzzyWatchNotSupported)
 	_, ok := h.get("public>>g>>svc*")
 	assert.False(t, ok)
+}
+
+// Regression for the lost-CANCEL race: a WATCH already in flight when the
+// last watcher is removed must not clobber the pending CANCEL. The
+// fakeRequester is armed to block the WATCH call after it is recorded (so
+// mustWatchCall can observe it started) but before it returns, letting the
+// test remove the watcher while the WATCH is still outstanding. Releasing it
+// with a nil (success) error must not stop a CANCEL_WATCH from following
+// promptly - specifically without waiting for an all-sync pass, since
+// pollInterval/failureBackoff are the only timers this test's holder uses.
+func TestRemovalDuringInFlightWatchStillSendsCancelPromptly(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	r.mu.Lock()
+	r.blockCalls = 1
+	r.release = make(chan struct{})
+	r.mu.Unlock()
+
+	id, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+
+	firstCall := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, firstCall.watchType)
+
+	h.RemoveWatcherByID("public>>g>>svc*", id)
+	close(r.release) // let the in-flight (now stale) WATCH return success
+
+	cancelCall := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, cancelCall.watchType,
+		"pending removal must not be starved behind a stale successful WATCH")
+	waitFor(t, func() bool { _, ok := h.get("public>>g>>svc*"); return !ok })
+}
+
+// Regression for the lost-reconnect-reset race: a WATCH already in flight
+// when ResetConsistenceStatus fires (simulating a reconnect) must not mark
+// the pattern consistent once it returns - the connection it succeeded on is
+// gone. A fresh WATCH must follow promptly on the new connection.
+func TestResetDuringInFlightWatchStillResendsPromptly(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	r.mu.Lock()
+	r.blockCalls = 1
+	r.release = make(chan struct{})
+	r.mu.Unlock()
+
+	_, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+
+	firstCall := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, firstCall.watchType)
+
+	h.ResetConsistenceStatus()
+	close(r.release) // let the stale (pre-reconnect) WATCH return success
+
+	secondCall := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, secondCall.watchType,
+		"a stale WATCH success must not suppress the post-reconnect resend")
+
+	waitFor(t, func() bool {
+		ctx, ok := h.get("public>>g>>svc*")
+		if !ok {
+			return false
+		}
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		return ctx.consistentWithServer
+	})
+}
+
+// A watcher registered while a pattern's CANCEL is in flight must revive the
+// pattern rather than let the confirmed CANCEL delete it out from under the
+// new registration. Kills the removePatternIfDiscarded mutant that always
+// removes on a successful CANCEL response regardless of current state
+// (`remove := true`): under that mutant this test's final WATCH never
+// arrives because the pattern (and its freshly appended entry) would have
+// been deleted from the holder before the revive could take effect.
+func TestReviveDuringCancelInFlightKeepsPatternAndResendsWatch(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	id, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+	first := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, first.watchType)
+
+	r.mu.Lock()
+	r.blockCalls = 1
+	r.release = make(chan struct{})
+	r.mu.Unlock()
+
+	h.RemoveWatcherByID("public>>g>>svc*", id)
+	cancelCall := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, cancelCall.watchType)
+
+	// Revive while the CANCEL response is still pending.
+	_, err = h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+
+	close(r.release) // let the CANCEL_WATCH call return success (nil)
+
+	// The pattern must survive the confirmed CANCEL and get re-WATCHed.
+	call := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, call.watchType, "revived pattern must be re-WATCHed")
+	_, ok := h.get("public>>g>>svc*")
+	assert.True(t, ok, "pattern must not be removed once revived before the CANCEL was confirmed")
+}
+
+// A pattern with one of two watchers removed must never be canceled: discard
+// only flips once the LAST watcher goes. Forces a re-send via
+// ResetConsistenceStatus (so the assertion isn't just "no RPC happened yet")
+// and asserts the re-send is a WATCH.
+func TestPartialRemovalNeverSendsCancelEvenAfterReset(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	id1, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+	first := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, first.watchType)
+
+	_, err = h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+
+	h.RemoveWatcherByID("public>>g>>svc*", id1)
+
+	// Observation window: nothing but healing (no RPC) should happen for a
+	// pattern that's still consistent and not discarded.
+	select {
+	case c := <-r.sent:
+		t.Fatalf("partial removal must not trigger any RPC, got %+v", c)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	h.ResetConsistenceStatus()
+	call := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, call.watchType,
+		"a pattern with a surviving watcher must never be CANCELed")
+}
+
+// TestCancelGateRequiresNonEmptyEntriesCheck directly exercises the
+// WATCH/CANCEL_WATCH gate in executeSync by fabricating a context in the
+// discard=true / entries-non-empty combination - unreachable through the
+// public API (RemoveWatcherByID only ever sets discard alongside an empty
+// entries slice, atomically under ctx.mu), but this is exactly the
+// combination that distinguishes the full gate (`ctx.discard &&
+// len(ctx.entries) == 0`) from a mutant that drops the length check
+// (`ctx.discard` alone): the mutant would send CANCEL_WATCH here since
+// discard is true, while the correct gate must send WATCH since a watcher is
+// still registered.
+func TestCancelGateRequiresNonEmptyEntriesCheck(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	h.mu.Lock()
+	ctx := newFuzzyWatchContext("public>>g>>svc*", h)
+	ctx.discard = true
+	ctx.entries = []*watcherEntry{{id: 1, fn: func(model.FuzzyWatchChangeEvent) {}, syncedKeys: map[string]struct{}{}}}
+	h.patterns.Set("public>>g>>svc*", ctx)
+	h.mu.Unlock()
+
+	call := mustWatchCall(t, r)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, call.watchType,
+		"discard alone must not trigger CANCEL_WATCH while entries is non-empty")
 }

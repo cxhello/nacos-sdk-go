@@ -69,7 +69,13 @@ func (h *FuzzyWatchServiceListHolder) executeSync() {
 			continue
 		}
 		ctx.mu.Lock()
-		if ctx.consistentWithServer {
+		// A discarded, now-empty context always needs its CANCEL sent: the
+		// consistentWithServer fast path below is for an established WATCH,
+		// and must never short-circuit a pending CANCEL, or the CANCEL would
+		// wait up to allSyncInterval behind a stale "consistent" flag left
+		// over from the WATCH that preceded the last watcher's removal.
+		discardedEmpty := ctx.discard && len(ctx.entries) == 0
+		if ctx.consistentWithServer && !discardedEmpty {
 			ctx.enqueueLocked(ctx.syncWatchersLocked()...)
 			if !needAllSync {
 				ctx.mu.Unlock()
@@ -77,7 +83,7 @@ func (h *FuzzyWatchServiceListHolder) executeSync() {
 			}
 		}
 		watchType := constant.FUZZY_WATCH_TYPE_WATCH
-		if ctx.discard && len(ctx.entries) == 0 {
+		if discardedEmpty {
 			watchType = constant.FUZZY_WATCH_TYPE_CANCEL_WATCH
 		}
 		keys := make([]string, 0, len(ctx.receivedGroupKeys))
@@ -85,6 +91,10 @@ func (h *FuzzyWatchServiceListHolder) executeSync() {
 			keys = append(keys, k)
 		}
 		isInitializing := !ctx.initialized
+		// epoch is snapshotted together with the rest of the desired state
+		// that this RPC represents, so the response handler below can tell
+		// whether desired state moved on while the RPC was in flight.
+		epoch := ctx.epoch
 		ctx.mu.Unlock()
 
 		err := r.SendFuzzyWatchRequest(pattern, watchType, keys, isInitializing)
@@ -94,8 +104,15 @@ func (h *FuzzyWatchServiceListHolder) executeSync() {
 				h.removePatternIfDiscarded(pattern)
 			} else {
 				ctx.mu.Lock()
-				ctx.consistentWithServer = true
-				ctx.lastOverLimitNotify = time.Time{}
+				// Only apply the success if desired state has not moved on
+				// since the snapshot this WATCH was sent from (e.g. a
+				// concurrent RemoveWatcherByID or ResetConsistenceStatus) -
+				// otherwise this stale response must not mark the pattern
+				// consistent; the newer desired state gets its own send.
+				if ctx.epoch == epoch {
+					ctx.consistentWithServer = true
+					ctx.lastOverLimitNotify = time.Time{}
+				}
 				ctx.mu.Unlock()
 			}
 		case isOverLimitError(err):
@@ -128,14 +145,19 @@ func isOverLimitError(err error) bool {
 }
 
 // notifyOverLimit fans a capacity rejection out to the pattern's load
-// watchers, suppressed to one notification per overLimitSuppress window; the
-// pattern stays inconsistent so the regular poll keeps retrying it.
+// watchers, suppressed to one notification per overLimitSuppress window. The
+// pattern is marked inconsistent unconditionally (independent of the
+// suppression window) so the regular poll keeps retrying it - without this,
+// an over-limit hit against a previously consistent pattern (its match count
+// grew past the server limit between polls) would otherwise wait out the
+// full allSyncInterval before the next WATCH attempt.
 func (h *FuzzyWatchServiceListHolder) notifyOverLimit(ctx *fuzzyWatchContext, pattern string, err error) {
 	var serverErr *FuzzyWatchServerError
 	errors.As(err, &serverErr)
 	logger.Warnf("fuzzy watch pattern:%s suppressed by server capacity limit: %v", pattern, err)
 	ctx.mu.Lock()
 	defer ctx.mu.Unlock()
+	ctx.consistentWithServer = false
 	if !ctx.lastOverLimitNotify.IsZero() && h.now().Sub(ctx.lastOverLimitNotify) < h.overLimitSuppress {
 		return
 	}

@@ -93,21 +93,35 @@ type fuzzyWatchContext struct {
 	syncVersion       uint64
 
 	// consistentWithServer is true once the reconcile worker's most recent
-	// WATCH RPC for this pattern succeeded and desired state has not changed
-	// since. The worker skips re-sending WATCH while true; ResetConsistenceStatus
-	// (on reconnect) and RemoveWatcherByID (which flips discard) both clear it
-	// to force a re-send. discard marks desired state as "not watched": set
+	// WATCH RPC for this pattern succeeded AND desired state has not changed
+	// since the snapshot that RPC was sent from - the "has not changed since"
+	// half is enforced by epoch (see below), not by consistentWithServer
+	// alone: a WATCH send races against concurrent desired-state mutations,
+	// so its success is only applied if epoch is still the value read before
+	// the send. The worker skips re-sending WATCH while consistentWithServer
+	// is true, UNLESS the pattern is also discard && empty - a pattern
+	// pending CANCEL must never be short-circuited by that fast path, or the
+	// CANCEL is starved until the next full resync. ResetConsistenceStatus
+	// (on reconnect), RemoveWatcherByID's last-watcher-removed path, and
+	// notifyOverLimit's capacity rejection all clear consistentWithServer to
+	// force a re-send. discard marks desired state as "not watched": set
 	// when the last watcher is removed, cleared if a new watcher revives the
 	// pattern before the in-flight CANCEL is confirmed. initDone is closed
 	// exactly once, by HandleSync on FINISH_FUZZY_WATCH_INIT_NOTIFY, and lets
 	// MatchedServiceKeys block until the initial batch sync completes.
 	// lastOverLimitNotify timestamps the last capacity-rejection load event
 	// fired for this pattern, so the worker can suppress repeats within
-	// overLimitSuppress.
+	// overLimitSuppress. epoch increments on every desired-state mutation
+	// (reconnect reset, a discard flip in either direction) and lets
+	// executeSync detect, when a WATCH RPC returns, whether the desired
+	// state it read before sending is still current - if not, the response
+	// must not flip consistentWithServer to true, since a newer desired
+	// state needs its own send.
 	consistentWithServer bool
 	discard              bool
 	initDone             chan struct{}
 	lastOverLimitNotify  time.Time
+	epoch                uint64
 
 	// pending/draining implement the async dispatcher: HandleSync and
 	// HandleChangeNotify enqueue tasks while holding mu, then release it.
@@ -592,7 +606,10 @@ func (h *FuzzyWatchServiceListHolder) RegisterWatcher(pattern string, cb func(mo
 	}
 	id := h.nextCallbackID.Add(1)
 	ctx.mu.Lock()
-	ctx.discard = false // revive a pattern whose CANCEL may be in flight
+	if ctx.discard {
+		ctx.discard = false // revive a pattern whose CANCEL may be in flight
+		ctx.epoch++         // invalidate any in-flight send's stale desired-state snapshot
+	}
 	entry := &watcherEntry{id: id, fn: cb, onLoadEvent: onLoad, syncedKeys: make(map[string]struct{})}
 	ctx.entries = append(ctx.entries, entry)
 	replay := make([]notifyTask, 0, len(ctx.receivedGroupKeys))
@@ -634,6 +651,7 @@ func (h *FuzzyWatchServiceListHolder) RemoveWatcherByID(pattern string, id uint6
 	if len(ctx.entries) == 0 {
 		ctx.discard = true
 		ctx.consistentWithServer = false
+		ctx.epoch++ // invalidate any in-flight WATCH send's stale desired-state snapshot
 	}
 	ctx.mu.Unlock()
 	h.mu.Unlock()
@@ -643,12 +661,15 @@ func (h *FuzzyWatchServiceListHolder) RemoveWatcherByID(pattern string, id uint6
 // ResetConsistenceStatus marks every pattern as out of sync with the server -
 // called on reconnect, since a fresh gRPC connection has no server-side WATCH
 // state left to be consistent with - and rings the worker to re-send them
-// all.
+// all. Bumping epoch invalidates any WATCH send already in flight on the old
+// connection: its eventual response must not mark the pattern consistent
+// under the new one.
 func (h *FuzzyWatchServiceListHolder) ResetConsistenceStatus() {
 	for _, pattern := range h.Patterns() {
 		if ctx, ok := h.get(pattern); ok {
 			ctx.mu.Lock()
 			ctx.consistentWithServer = false
+			ctx.epoch++
 			ctx.mu.Unlock()
 		}
 	}
