@@ -551,6 +551,32 @@ func TestDeliverySkipsPerWatcherDuplicates(t *testing.T) {
 	assert.Equal(t, int32(1), count.Load(), "duplicate ADD must be skipped per watcher")
 }
 
+// TestDeliverySkipsDeleteForKeyWatcherNeverSaw asserts deliver's DELETE skip
+// branch: a DELETE task must not invoke the callback for a watcher whose own
+// syncedKeys never recorded the key, even though pattern-level
+// receivedGroupKeys knew about it. A watcher ends up in exactly this state
+// when its ADD delivery for the key was dropped by the bounded queue (see
+// TestPendingQueueIsBounded); that scenario is reproduced directly here by
+// enqueuing a DELETE task against a freshly registered entry that was never
+// delivered the matching ADD, so its syncedKeys is still empty.
+func TestDeliverySkipsDeleteForKeyWatcherNeverSaw(t *testing.T) {
+	h := NewFuzzyWatchServiceListHolder("public")
+	var count atomic.Int32
+	h.RegisterPattern("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) { count.Add(1) })
+	ctx, _ := h.get("public>>g>>svc*")
+
+	ctx.mu.Lock()
+	entries := append([]*watcherEntry(nil), ctx.entries...)
+	require.Empty(t, entries[0].syncedKeys, "watcher must not have seen this key yet")
+	ev := model.FuzzyWatchChangeEvent{ServiceName: "svc1", GroupName: "g", NamespaceId: "public",
+		ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE, SyncType: constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY}
+	ctx.enqueueLocked(notifyTask{event: &ev, targets: entries})
+	ctx.mu.Unlock()
+
+	time.Sleep(200 * time.Millisecond)
+	assert.Equal(t, int32(0), count.Load(), "DELETE for a key the watcher never saw ADD for must not fire")
+}
+
 func TestHolderRemoveCallbackByIDAndPattern(t *testing.T) {
 	holder := NewFuzzyWatchServiceListHolder("public")
 	var aCount, bCount int

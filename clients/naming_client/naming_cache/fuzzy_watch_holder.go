@@ -73,11 +73,13 @@ type notifyTask struct {
 // The pending queue is bounded by pendingLimit (default 1024, copied in from
 // the holder by newFuzzyWatchContext). When a pattern's callbacks fall
 // behind and the queue fills, enqueueLocked drops the new notification
-// rather than growing pending without bound; the drop is safe because
-// receivedGroupKeys was already updated by applyChange before the enqueue,
-// and a watcher's own syncedKeys is only advanced on actual delivery - so
-// the reconcile worker's diff-sync can detect the gap from a stale
-// syncVersion and re-deliver whatever was dropped.
+// rather than growing pending without bound. A dropped task never marks its
+// key as seen in the affected watcher's syncedKeys - that only advances on
+// actual delivery - while receivedGroupKeys stays complete independently of
+// dispatch, since applyChange updates it before the enqueue. So a watcher
+// that missed a delivery is detectable after the fact: its syncedKeys will
+// differ from receivedGroupKeys for that key. Nothing in this file acts on
+// that gap; a dropped notification is not re-delivered.
 type fuzzyWatchContext struct {
 	pattern           string
 	receivedGroupKeys map[string]struct{}
@@ -94,7 +96,14 @@ type fuzzyWatchContext struct {
 	pending      []notifyTask
 	draining     bool
 	pendingLimit int
-	onDrop       func()
+
+	// onDrop, when set, is invoked once for every notification enqueueLocked
+	// drops for exceeding pendingLimit. It is called synchronously with c.mu
+	// held: it must be non-blocking and must not re-enter the holder or take
+	// any holder/context lock (h.mu, or any fuzzyWatchContext's mu including
+	// this one) - taking ctx.mu recursively self-deadlocks, and taking h.mu
+	// inverts the holder's h.mu -> ctx.mu lock order (see RegisterPattern).
+	onDrop func()
 
 	mu sync.Mutex
 }
@@ -102,8 +111,8 @@ type fuzzyWatchContext struct {
 // newFuzzyWatchContext creates the per-pattern dispatch state, carrying the
 // holder's configured queue bound onto the context so enqueueLocked doesn't
 // need to reach back into the holder on every call. onDrop is left nil here;
-// the reconcile worker wires it in to ring the bell for a diff-sync when a
-// notification gets dropped.
+// see the field's comment on fuzzyWatchContext for the contract an assignment
+// must honor.
 func newFuzzyWatchContext(pattern string, h *FuzzyWatchServiceListHolder) *fuzzyWatchContext {
 	return &fuzzyWatchContext{
 		pattern:           pattern,
@@ -129,10 +138,13 @@ func (c *fuzzyWatchContext) enqueueLocked(tasks ...notifyTask) {
 	}
 	for _, task := range tasks {
 		if c.pendingLimit > 0 && len(c.pending) >= c.pendingLimit {
-			// Dropping the notification is safe because receivedGroupKeys was
-			// already updated: the reconcile worker's diff-sync re-delivers
-			// anything a watcher missed (its syncedKeys is only updated on
-			// actual delivery). onDrop rings the bell to schedule that sync.
+			// receivedGroupKeys was already updated for this key before the
+			// enqueue (applyChange runs first), so dropping here does not
+			// corrupt pattern-level state. It does leave a gap: the affected
+			// watcher's syncedKeys only advances on actual delivery, so it
+			// will now lag receivedGroupKeys for this key, and nothing
+			// re-delivers the drop. onDrop is only an observation hook - see
+			// its field comment for the contract it must honor.
 			logger.Warnf("fuzzy watch pattern:%s dispatch queue full (%d), dropping notification", c.pattern, c.pendingLimit)
 			if c.onDrop != nil {
 				c.onDrop()
@@ -167,8 +179,10 @@ func (c *fuzzyWatchContext) drain() {
 // deliver dispatches one task to its snapshotted targets. The per-watcher
 // ADD/DELETE skip decision and the syncedKeys update happen at delivery time
 // under c.mu (not enqueue time), so queued ADD/DELETE sequences for the same
-// key resolve in order, and a task dropped by the queue bound never marks the
-// key as seen - which is exactly what lets diff-sync re-deliver it later.
+// key resolve in order. A task dropped by the queue bound (see enqueueLocked)
+// never reaches here, so it never marks the key as seen in syncedKeys - that
+// watcher's syncedKeys is left lagging receivedGroupKeys for this key, with
+// no re-delivery.
 func (c *fuzzyWatchContext) deliver(task notifyTask) {
 	for _, entry := range task.targets {
 		if task.loadEvent != nil {
