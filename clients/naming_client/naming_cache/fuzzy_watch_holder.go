@@ -17,10 +17,12 @@
 package naming_cache
 
 import (
+	"context"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/pkg/errors"
 
@@ -78,14 +80,34 @@ type notifyTask struct {
 // actual delivery - while receivedGroupKeys stays complete independently of
 // dispatch, since applyChange updates it before the enqueue. So a watcher
 // that missed a delivery is detectable after the fact: its syncedKeys will
-// differ from receivedGroupKeys for that key. Nothing in this file acts on
-// that gap; a dropped notification is not re-delivered.
+// differ from receivedGroupKeys for that key. That gap is not re-delivered
+// here; it is healed out-of-band by the reconcile worker's
+// syncWatchersLocked (fuzzy_watch_worker.go), which diffs a lagging
+// watcher's syncedKeys against receivedGroupKeys and replays the missing
+// ADD/DELETE events.
 type fuzzyWatchContext struct {
 	pattern           string
 	receivedGroupKeys map[string]struct{}
 	entries           []*watcherEntry
 	initialized       bool
 	syncVersion       uint64
+
+	// consistentWithServer is true once the reconcile worker's most recent
+	// WATCH RPC for this pattern succeeded and desired state has not changed
+	// since. The worker skips re-sending WATCH while true; ResetConsistenceStatus
+	// (on reconnect) and RemoveWatcherByID (which flips discard) both clear it
+	// to force a re-send. discard marks desired state as "not watched": set
+	// when the last watcher is removed, cleared if a new watcher revives the
+	// pattern before the in-flight CANCEL is confirmed. initDone is closed
+	// exactly once, by HandleSync on FINISH_FUZZY_WATCH_INIT_NOTIFY, and lets
+	// MatchedServiceKeys block until the initial batch sync completes.
+	// lastOverLimitNotify timestamps the last capacity-rejection load event
+	// fired for this pattern, so the worker can suppress repeats within
+	// overLimitSuppress.
+	consistentWithServer bool
+	discard              bool
+	initDone             chan struct{}
+	lastOverLimitNotify  time.Time
 
 	// pending/draining implement the async dispatcher: HandleSync and
 	// HandleChangeNotify enqueue tasks while holding mu, then release it.
@@ -103,6 +125,8 @@ type fuzzyWatchContext struct {
 	// any holder/context lock (h.mu, or any fuzzyWatchContext's mu including
 	// this one) - taking ctx.mu recursively self-deadlocks, and taking h.mu
 	// inverts the holder's h.mu -> ctx.mu lock order (see RegisterPattern).
+	// newFuzzyWatchContext wires this to h.Bell, which satisfies the contract:
+	// a non-blocking channel send that touches no lock.
 	onDrop func()
 
 	mu sync.Mutex
@@ -110,14 +134,18 @@ type fuzzyWatchContext struct {
 
 // newFuzzyWatchContext creates the per-pattern dispatch state, carrying the
 // holder's configured queue bound onto the context so enqueueLocked doesn't
-// need to reach back into the holder on every call. onDrop is left nil here;
-// see the field's comment on fuzzyWatchContext for the contract an assignment
-// must honor.
+// need to reach back into the holder on every call. onDrop is wired to
+// h.Bell, which satisfies the non-blocking, lock-free contract documented on
+// the field: a dropped notification wakes the reconcile worker so it can
+// heal the resulting per-watcher lag via syncWatchersLocked. initDone is
+// created open and closed exactly once by HandleSync on FINISH.
 func newFuzzyWatchContext(pattern string, h *FuzzyWatchServiceListHolder) *fuzzyWatchContext {
 	return &fuzzyWatchContext{
 		pattern:           pattern,
 		receivedGroupKeys: make(map[string]struct{}),
 		pendingLimit:      h.pendingLimit,
+		onDrop:            h.Bell,
+		initDone:          make(chan struct{}),
 	}
 }
 
@@ -142,9 +170,10 @@ func (c *fuzzyWatchContext) enqueueLocked(tasks ...notifyTask) {
 			// enqueue (applyChange runs first), so dropping here does not
 			// corrupt pattern-level state. It does leave a gap: the affected
 			// watcher's syncedKeys only advances on actual delivery, so it
-			// will now lag receivedGroupKeys for this key, and nothing
-			// re-delivers the drop. onDrop is only an observation hook - see
-			// its field comment for the contract it must honor.
+			// will now lag receivedGroupKeys for this key. The reconcile
+			// worker's syncWatchersLocked (fuzzy_watch_worker.go) heals this
+			// on its next pass. onDrop is only an observation hook - see its
+			// field comment for the contract it must honor.
 			logger.Warnf("fuzzy watch pattern:%s dispatch queue full (%d), dropping notification", c.pattern, c.pendingLimit)
 			if c.onDrop != nil {
 				c.onDrop()
@@ -181,9 +210,12 @@ func (c *fuzzyWatchContext) drain() {
 // under c.mu (not enqueue time), so queued ADD/DELETE sequences for the same
 // key resolve in order. A task dropped by the queue bound (see enqueueLocked)
 // never reaches here, so it never marks the key as seen in syncedKeys - that
-// watcher's syncedKeys is left lagging receivedGroupKeys for this key, with
-// no re-delivery.
+// watcher's syncedKeys is left lagging receivedGroupKeys for this key until
+// the reconcile worker's syncWatchersLocked heals it.
 func (c *fuzzyWatchContext) deliver(task notifyTask) {
+	if task.event == nil && task.loadEvent == nil {
+		return
+	}
 	for _, entry := range task.targets {
 		if task.loadEvent != nil {
 			if entry.onLoadEvent != nil {
@@ -279,13 +311,6 @@ type FuzzyWatchServiceListHolder struct {
 	patterns  cache.ConcurrentMap // groupKeyPattern -> *fuzzyWatchContext
 	mu        sync.Mutex          // serializes pattern create/remove
 
-	// pendingLimit bounds every pattern context's dispatch queue (see
-	// fuzzyWatchContext.pending). newFuzzyWatchContext copies it in at
-	// context-creation time, so changing it later only affects patterns
-	// registered afterward - existing contexts keep the bound they were
-	// created with.
-	pendingLimit int
-
 	// nextCallbackID is an atomic counter handed out by RegisterPattern so
 	// every registration - even a repeat registration of the same func
 	// value - gets its own identity to cancel by. atomic.Uint64 (rather than
@@ -293,14 +318,49 @@ type FuzzyWatchServiceListHolder struct {
 	// guarantee, avoiding the 32-bit "unaligned 64-bit atomic operation"
 	// panic that a plain uint64 field risks on GOARCH=386/arm.
 	nextCallbackID atomic.Uint64
+
+	// requester is the transport the reconcile worker sends WATCH/CANCEL_WATCH
+	// RPCs through. It is nil until SetRequester is called (mirrors Java
+	// registerNamingGrpcClientProxy, which runs after construction to avoid an
+	// import cycle), so the worker loop tolerates a nil requester as a no-op.
+	requester   FuzzyWatchRequester
+	requesterMu sync.RWMutex
+
+	bell     chan struct{} // cap 1: rings coalesce naturally
+	stopCh   chan struct{}
+	stopOnce sync.Once
+	started  atomic.Bool
+
+	// Reconcile cadence. Fields (not consts) so tests inject a fake clock and
+	// short intervals; defaults mirror the Java client.
+	now               func() time.Time
+	pollInterval      time.Duration // 5s
+	allSyncInterval   time.Duration // 3min
+	overLimitSuppress time.Duration // 60s
+	failureBackoff    time.Duration // 1s
+	lastAllSync       time.Time
+
+	// pendingLimit bounds every pattern context's dispatch queue (see
+	// fuzzyWatchContext.pending). newFuzzyWatchContext copies it in at
+	// context-creation time, so changing it later only affects patterns
+	// registered afterward - existing contexts keep the bound they were
+	// created with.
+	pendingLimit int // 1024
 }
 
 // NewFuzzyWatchServiceListHolder creates an empty holder for the given namespace.
 func NewFuzzyWatchServiceListHolder(namespace string) *FuzzyWatchServiceListHolder {
 	return &FuzzyWatchServiceListHolder{
-		namespace:    namespace,
-		patterns:     cache.NewConcurrentMap(),
-		pendingLimit: 1024,
+		namespace:         namespace,
+		patterns:          cache.NewConcurrentMap(),
+		pendingLimit:      1024,
+		bell:              make(chan struct{}, 1),
+		stopCh:            make(chan struct{}),
+		now:               time.Now,
+		pollInterval:      5 * time.Second,
+		allSyncInterval:   3 * time.Minute,
+		overLimitSuppress: 60 * time.Second,
+		failureBackoff:    time.Second,
 	}
 }
 
@@ -482,6 +542,136 @@ func (h *FuzzyWatchServiceListHolder) ReceivedGroupKeys(pattern string) []string
 	return keys
 }
 
+// SetRequester wires the transport the reconcile worker sends WATCH/CANCEL_WATCH
+// RPCs through. Called once after construction (see the requester field
+// comment), so a concurrent RegisterWatcher racing this call either observes
+// nil (fails fast with ErrFuzzyWatchNotSupported) or the fully-set requester -
+// never a half-initialized one, since requesterMu serializes both.
+func (h *FuzzyWatchServiceListHolder) SetRequester(r FuzzyWatchRequester) {
+	h.requesterMu.Lock()
+	defer h.requesterMu.Unlock()
+	h.requester = r
+}
+
+func (h *FuzzyWatchServiceListHolder) getRequester() FuzzyWatchRequester {
+	h.requesterMu.RLock()
+	defer h.requesterMu.RUnlock()
+	return h.requester
+}
+
+// Bell rings the reconcile worker without blocking; a ring already pending
+// coalesces with this one, so callers never need to worry about flooding the
+// worker with redundant wakeups.
+func (h *FuzzyWatchServiceListHolder) Bell() {
+	select {
+	case h.bell <- struct{}{}:
+	default: // a ring is already pending; coalesce
+	}
+}
+
+// RegisterWatcher adds one watcher to pattern purely locally (reviving a
+// pending-cancel pattern if needed), replays already-known matches to the new
+// watcher only, and rings the reconcile worker. The server RPC outcome never
+// affects the registration: capacity problems surface through onLoad, and
+// transient failures are retried in the background until consistent.
+func (h *FuzzyWatchServiceListHolder) RegisterWatcher(pattern string, cb func(model.FuzzyWatchChangeEvent), onLoad func(model.FuzzyWatchLoadEvent)) (uint64, error) {
+	if cb == nil {
+		return 0, errors.New("watchCallback cannot be nil!")
+	}
+	r := h.getRequester()
+	if r == nil || !r.ServerSupportsFuzzyWatch() {
+		return 0, ErrFuzzyWatchNotSupported
+	}
+	h.mu.Lock()
+	var ctx *fuzzyWatchContext
+	if v, ok := h.patterns.Get(pattern); ok {
+		ctx = v.(*fuzzyWatchContext)
+	} else {
+		ctx = newFuzzyWatchContext(pattern, h)
+		h.patterns.Set(pattern, ctx)
+	}
+	id := h.nextCallbackID.Add(1)
+	ctx.mu.Lock()
+	ctx.discard = false // revive a pattern whose CANCEL may be in flight
+	entry := &watcherEntry{id: id, fn: cb, onLoadEvent: onLoad, syncedKeys: make(map[string]struct{})}
+	ctx.entries = append(ctx.entries, entry)
+	replay := make([]notifyTask, 0, len(ctx.receivedGroupKeys))
+	for serviceKey := range ctx.receivedGroupKeys {
+		namespace, group, service, err := parseServiceKey(serviceKey)
+		if err != nil {
+			continue
+		}
+		ev := model.FuzzyWatchChangeEvent{ServiceName: service, GroupName: group, NamespaceId: namespace,
+			ChangedType: constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, SyncType: constant.FUZZY_WATCH_INIT_NOTIFY}
+		replay = append(replay, notifyTask{event: &ev, targets: []*watcherEntry{entry}})
+	}
+	ctx.enqueueLocked(replay...)
+	ctx.mu.Unlock()
+	h.mu.Unlock()
+	h.Bell()
+	return id, nil
+}
+
+// RemoveWatcherByID removes exactly one registration. When the last watcher
+// goes, the pattern flips to discard (desired state: not watched) and the
+// worker sends the server-side CANCEL; local state stays until the server
+// confirms, so pushes keep being handled meanwhile.
+func (h *FuzzyWatchServiceListHolder) RemoveWatcherByID(pattern string, id uint64) {
+	h.mu.Lock()
+	ctx, ok := h.get(pattern)
+	if !ok {
+		h.mu.Unlock()
+		return
+	}
+	ctx.mu.Lock()
+	kept := ctx.entries[:0:0]
+	for _, e := range ctx.entries {
+		if e.id != id {
+			kept = append(kept, e)
+		}
+	}
+	ctx.entries = kept
+	if len(ctx.entries) == 0 {
+		ctx.discard = true
+		ctx.consistentWithServer = false
+	}
+	ctx.mu.Unlock()
+	h.mu.Unlock()
+	h.Bell()
+}
+
+// ResetConsistenceStatus marks every pattern as out of sync with the server -
+// called on reconnect, since a fresh gRPC connection has no server-side WATCH
+// state left to be consistent with - and rings the worker to re-send them
+// all.
+func (h *FuzzyWatchServiceListHolder) ResetConsistenceStatus() {
+	for _, pattern := range h.Patterns() {
+		if ctx, ok := h.get(pattern); ok {
+			ctx.mu.Lock()
+			ctx.consistentWithServer = false
+			ctx.mu.Unlock()
+		}
+	}
+	h.Bell()
+}
+
+// MatchedServiceKeys blocks until pattern's initial sync finishes (or waitCtx
+// is done, whichever comes first) and then returns the current matched-key
+// snapshot. It is the synchronous counterpart to the callback-based watcher
+// API, for callers that need an immediate, complete match list.
+func (h *FuzzyWatchServiceListHolder) MatchedServiceKeys(waitCtx context.Context, pattern string) ([]string, error) {
+	pctx, ok := h.get(pattern)
+	if !ok {
+		return nil, errors.Errorf("pattern %s is not being fuzzy watched", pattern)
+	}
+	select {
+	case <-pctx.initDone:
+		return h.ReceivedGroupKeys(pattern), nil
+	case <-waitCtx.Done():
+		return nil, waitCtx.Err()
+	}
+}
+
 // HandleSync processes a server-pushed NamingFuzzyWatchSyncRequest: a batch of
 // matched services for pattern. INIT / DIFF batches add or remove keys by
 // changedType and enqueue callbacks for async dispatch; a FINISH batch just
@@ -502,7 +692,13 @@ func (h *FuzzyWatchServiceListHolder) HandleSync(pattern, syncType string, conte
 
 	if syncType == constant.FINISH_FUZZY_WATCH_INIT_NOTIFY {
 		ctx.mu.Lock()
-		ctx.initialized = true
+		// initialized guards the close: FINISH can arrive more than once
+		// across reconnects (each reconnect re-sends the initial batch), and
+		// closing an already-closed channel panics.
+		if !ctx.initialized {
+			ctx.initialized = true
+			close(ctx.initDone)
+		}
 		ctx.mu.Unlock()
 		logger.Infof("fuzzy watch pattern:%s initial sync finished, batch %d/%d", pattern, currentBatch, totalBatch)
 		return
