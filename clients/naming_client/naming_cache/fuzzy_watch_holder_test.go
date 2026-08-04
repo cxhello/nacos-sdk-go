@@ -596,4 +596,3 @@ func TestDeliverySkipsDeleteForKeyWatcherNeverSaw(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 	assert.Equal(t, int32(0), count.Load(), "DELETE for a key the watcher never saw ADD for must not fire")
 }
-

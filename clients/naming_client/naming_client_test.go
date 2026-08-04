@@ -797,4 +797,3 @@ func TestFuzzyWatchHandle_CancelStopsDelivery(t *testing.T) {
 	case <-time.After(200 * time.Millisecond):
 	}
 }
-
