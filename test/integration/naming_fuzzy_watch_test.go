@@ -19,9 +19,12 @@
 package integration
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -30,6 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/clients"
+	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
@@ -44,19 +48,75 @@ import (
 // server is 3.x, without needing admin credentials.
 func isNacosV3Admin(t *testing.T) bool {
 	t.Helper()
-	ip := envOr("NACOS_SERVER_IP", "127.0.0.1")
-	port := envOr("NACOS_SERVER_PORT", "8848")
+	return isNacosV3AdminAt(t, envOr("NACOS_SERVER_IP", "127.0.0.1"), envOr("NACOS_SERVER_PORT", "8848"))
+}
+
+// isNacosV3AdminAt generalizes isNacosV3Admin to an explicit ip:port, so the
+// 2.x-only ability scenario (fuzzy watch is not advertised by 2.x servers)
+// can probe a server other than the suite-wide NACOS_SERVER_IP/NACOS_SERVER_PORT
+// target.
+func isNacosV3AdminAt(t *testing.T, ip, port string) bool {
+	t.Helper()
 	url := fmt.Sprintf("http://%s:%s/nacos/v3/admin/ns/service/list?pageNo=1&pageSize=1&namespaceId=&groupName=%s",
 		ip, port, constant.DEFAULT_GROUP)
 
 	httpClient := &http.Client{Timeout: 5 * time.Second}
 	resp, err := httpClient.Get(url)
 	if err != nil {
-		t.Logf("v3 admin API probe failed: %v", err)
+		t.Logf("v3 admin API probe against %s:%s failed: %v", ip, port, err)
 		return false
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode != http.StatusNotFound && resp.StatusCode != http.StatusNotImplemented
+}
+
+// clientParamAt mirrors clientParam (test/integration/integration_test.go)
+// but targets an explicit ip:port instead of the suite-wide
+// NACOS_SERVER_IP/NACOS_SERVER_PORT target. Needed by the 2.x-only ability
+// scenario, which must reach a server independent of whichever one the rest
+// of the suite is currently pointed at.
+func clientParamAt(t *testing.T, ip, port string) vo.NacosClientParam {
+	t.Helper()
+	p, err := strconv.ParseUint(port, 10, 64)
+	require.NoError(t, err, "invalid port %s", port)
+
+	sc := []constant.ServerConfig{
+		*constant.NewServerConfig(ip, p, constant.WithContextPath("/nacos")),
+	}
+	cc := *constant.NewClientConfig(
+		constant.WithNamespaceId(""),
+		constant.WithUsername(envOr("NACOS_USERNAME", "nacos")),
+		constant.WithPassword(envOr("NACOS_PASSWORD", "nacos")),
+		constant.WithTimeoutMs(10000),
+		constant.WithNotLoadCacheAtStart(true),
+		constant.WithUpdateCacheWhenEmpty(true),
+		constant.WithLogDir(t.TempDir()),
+		constant.WithCacheDir(t.TempDir()),
+		constant.WithLogLevel("warn"),
+	)
+	return vo.NacosClientParam{ClientConfig: &cc, ServerConfigs: sc}
+}
+
+// fuzzyWatchV2ClientParam resolves a client param for a Nacos 2.x server, to
+// exercise the ErrFuzzyWatchNotSupported fast-fail path. CI's
+// integration-nacos2 leg (.github/workflows/ci.yml) runs a single 2.x server
+// on the suite-wide NACOS_SERVER_IP/NACOS_SERVER_PORT target, so when that
+// target is already 2.x this simply reuses it. Local dev instead runs a 3.x
+// and a 2.x server side by side, so NACOS2_SERVER_IP/NACOS2_SERVER_PORT
+// (default 127.0.0.1:8858) name the secondary 2.x server in that case. The
+// bool return is false when neither option resolves to a reachable 2.x
+// server, telling the caller to skip.
+func fuzzyWatchV2ClientParam(t *testing.T) (vo.NacosClientParam, bool) {
+	t.Helper()
+	if !isNacosV3Admin(t) {
+		return clientParam(t), true
+	}
+	ip := envOr("NACOS2_SERVER_IP", "127.0.0.1")
+	port := envOr("NACOS2_SERVER_PORT", "8858")
+	if isNacosV3AdminAt(t, ip, port) {
+		return vo.NacosClientParam{}, false
+	}
+	return clientParamAt(t, ip, port), true
 }
 
 // eventRecorder is a mutex-guarded collector for fuzzy watch events, shared
@@ -406,4 +466,226 @@ func TestIntegrationNamingFuzzyWatchCancelNoResurrection(t *testing.T) {
 		"no events of any kind should reach the canceled callback after cancellation")
 
 	t.Logf("syncTypes observed before cancel: %v", recorder.syncTypes())
+}
+
+// TestFuzzyWatchWatcherScopedCancelIntegration exercises watcher-scoped
+// cancellation across two handles on the same pattern: canceling one must
+// leave the other fully functional, and only once every handle on the
+// pattern has been canceled (last watcher gone, server-side CANCEL sent by
+// the reconcile worker) must new matching registrations stop producing any
+// callback at all.
+func TestFuzzyWatchWatcherScopedCancelIntegration(t *testing.T) {
+	if !isNacosV3Admin(t) {
+		t.Skip("fuzzy watch requires nacos 3.x")
+	}
+
+	watchClient, err := clients.NewNamingClient(clientParam(t))
+	require.NoError(t, err, "create naming client for fuzzy watch")
+	defer watchClient.CloseClient()
+
+	suffix := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	pattern := fmt.Sprintf("fuzzy-svc-scoped-%s-*", suffix)
+	survivorServiceName := fmt.Sprintf("fuzzy-svc-scoped-%s-survivor", suffix)
+	afterAllCanceledServiceName := fmt.Sprintf("fuzzy-svc-scoped-%s-after-all-canceled", suffix)
+
+	recorder1 := &eventRecorder{}
+	fwParam1 := &vo.FuzzyWatchParam{
+		ServiceNamePattern: pattern,
+		GroupNamePattern:   constant.DEFAULT_GROUP,
+		WatchCallback:      recorder1.record,
+	}
+	handle1, err := watchClient.FuzzyWatch(fwParam1)
+	require.NoError(t, err, "fuzzy watch %s (handle1)", pattern)
+
+	recorder2 := &eventRecorder{}
+	fwParam2 := &vo.FuzzyWatchParam{
+		ServiceNamePattern: pattern,
+		GroupNamePattern:   constant.DEFAULT_GROUP,
+		WatchCallback:      recorder2.record,
+	}
+	handle2, err := watchClient.FuzzyWatch(fwParam2)
+	require.NoError(t, err, "fuzzy watch %s (handle2)", pattern)
+
+	regClient, err := clients.NewNamingClient(clientParam(t))
+	require.NoError(t, err, "create naming client for registration")
+	defer regClient.CloseClient()
+
+	const ip = "10.0.0.44"
+	const survivorPort uint64 = 19500
+	const afterAllCanceledPort uint64 = 19501
+
+	// Cancel handle1 before registering anything, so the only way recorder2
+	// can observe the upcoming registration is via its own still-live watch -
+	// proving cancellation is scoped to handle1 alone, not the whole pattern.
+	handle1.Cancel()
+
+	ok, err := regClient.RegisterInstance(vo.RegisterInstanceParam{
+		Ip:          ip,
+		Port:        survivorPort,
+		ServiceName: survivorServiceName,
+		GroupName:   constant.DEFAULT_GROUP,
+		Weight:      1,
+		Enable:      true,
+		Healthy:     true,
+		Ephemeral:   true,
+	})
+	require.NoError(t, err, "register matching service after canceling handle1")
+	require.True(t, ok, "register matching service after canceling handle1 should return true")
+	defer func() {
+		_, _ = regClient.DeregisterInstance(vo.DeregisterInstanceParam{
+			Ip: ip, Port: survivorPort, ServiceName: survivorServiceName, GroupName: constant.DEFAULT_GROUP, Ephemeral: true,
+		})
+	}()
+
+	require.Eventually(t, func() bool {
+		_, found := recorder2.find(constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, survivorServiceName)
+		return found
+	}, waitTimeout, waitInterval, "surviving handle2 should observe ADD_SERVICE for a service registered after handle1 was canceled")
+
+	_, found := recorder1.find(constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, survivorServiceName)
+	assert.False(t, found, "canceled handle1 must not observe ADD_SERVICE for a service registered after its own cancellation")
+
+	// Cancel the last remaining handle. The server-side CANCEL is sent
+	// asynchronously by the reconcile worker (bell-triggered, effectively
+	// immediate at the 5s poll cadence) - settle briefly before registering
+	// the next probe so this exercises the pattern actually being torn down
+	// server-side, not just a race against the worker's next tick.
+	handle2.Cancel()
+	time.Sleep(3 * time.Second)
+
+	ok, err = regClient.RegisterInstance(vo.RegisterInstanceParam{
+		Ip:          ip,
+		Port:        afterAllCanceledPort,
+		ServiceName: afterAllCanceledServiceName,
+		GroupName:   constant.DEFAULT_GROUP,
+		Weight:      1,
+		Enable:      true,
+		Healthy:     true,
+		Ephemeral:   true,
+	})
+	require.NoError(t, err, "register matching service after canceling every handle")
+	require.True(t, ok, "register matching service after canceling every handle should return true")
+	defer func() {
+		_, _ = regClient.DeregisterInstance(vo.DeregisterInstanceParam{
+			Ip: ip, Port: afterAllCanceledPort, ServiceName: afterAllCanceledServiceName, GroupName: constant.DEFAULT_GROUP, Ephemeral: true,
+		})
+	}()
+
+	// Bounded poll rather than require.Eventually: there is nothing to wait
+	// FOR here, only the absence of an event on either recorder, so every
+	// sample in the window must fail to find one.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		_, found1 := recorder1.find(constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, afterAllCanceledServiceName)
+		require.False(t, found1, "handle1 must not observe ADD_SERVICE once the whole pattern has been canceled")
+		_, found2 := recorder2.find(constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE, afterAllCanceledServiceName)
+		require.False(t, found2, "handle2 must not observe ADD_SERVICE once the whole pattern has been canceled")
+		time.Sleep(waitInterval)
+	}
+}
+
+// TestFuzzyWatchMatchedServiceKeysIntegration exercises the synchronous
+// MatchedServiceKeys accessor: services registered before the watch starts
+// must appear in the server's initial batch sync, and MatchedServiceKeys
+// must return exactly that set once the sync completes.
+func TestFuzzyWatchMatchedServiceKeysIntegration(t *testing.T) {
+	if !isNacosV3Admin(t) {
+		t.Skip("fuzzy watch requires nacos 3.x")
+	}
+
+	regClient, err := clients.NewNamingClient(clientParam(t))
+	require.NoError(t, err, "create naming client for registration")
+	defer regClient.CloseClient()
+
+	suffix := fmt.Sprintf("%d-%d", time.Now().UnixNano(), os.Getpid())
+	pattern := fmt.Sprintf("fuzzy-svc-matched-%s-*", suffix)
+	serviceName1 := fmt.Sprintf("fuzzy-svc-matched-%s-1", suffix)
+	serviceName2 := fmt.Sprintf("fuzzy-svc-matched-%s-2", suffix)
+
+	const ip = "10.0.0.45"
+	const port1 uint64 = 19600
+	const port2 uint64 = 19601
+
+	ok, err := regClient.RegisterInstance(vo.RegisterInstanceParam{
+		Ip: ip, Port: port1, ServiceName: serviceName1, GroupName: constant.DEFAULT_GROUP,
+		Weight: 1, Enable: true, Healthy: true, Ephemeral: true,
+	})
+	require.NoError(t, err, "register first matching service")
+	require.True(t, ok, "register first matching service should return true")
+	defer func() {
+		_, _ = regClient.DeregisterInstance(vo.DeregisterInstanceParam{
+			Ip: ip, Port: port1, ServiceName: serviceName1, GroupName: constant.DEFAULT_GROUP, Ephemeral: true,
+		})
+	}()
+
+	ok, err = regClient.RegisterInstance(vo.RegisterInstanceParam{
+		Ip: ip, Port: port2, ServiceName: serviceName2, GroupName: constant.DEFAULT_GROUP,
+		Weight: 1, Enable: true, Healthy: true, Ephemeral: true,
+	})
+	require.NoError(t, err, "register second matching service")
+	require.True(t, ok, "register second matching service should return true")
+	defer func() {
+		_, _ = regClient.DeregisterInstance(vo.DeregisterInstanceParam{
+			Ip: ip, Port: port2, ServiceName: serviceName2, GroupName: constant.DEFAULT_GROUP, Ephemeral: true,
+		})
+	}()
+
+	// Both services must be server-side discoverable before the watch starts,
+	// otherwise the FuzzyWatch below could catch the server mid-registration
+	// and miss one from the INIT batch - flaky, not a product bug.
+	require.Eventually(t, func() bool {
+		instances1, err1 := regClient.SelectInstances(vo.SelectInstancesParam{ServiceName: serviceName1, GroupName: constant.DEFAULT_GROUP, HealthyOnly: true})
+		instances2, err2 := regClient.SelectInstances(vo.SelectInstancesParam{ServiceName: serviceName2, GroupName: constant.DEFAULT_GROUP, HealthyOnly: true})
+		return err1 == nil && err2 == nil && len(instances1) == 1 && len(instances2) == 1
+	}, waitTimeout, waitInterval, "both matching services should be discoverable before the watch starts")
+
+	watchClient, err := clients.NewNamingClient(clientParam(t))
+	require.NoError(t, err, "create naming client for fuzzy watch")
+	defer watchClient.CloseClient()
+
+	fwParam := &vo.FuzzyWatchParam{
+		ServiceNamePattern: pattern,
+		GroupNamePattern:   constant.DEFAULT_GROUP,
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	}
+	handle, err := watchClient.FuzzyWatch(fwParam)
+	require.NoError(t, err, "fuzzy watch %s", pattern)
+	defer handle.Cancel()
+
+	waitCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	keys, err := handle.MatchedServiceKeys(waitCtx)
+	require.NoError(t, err, "MatchedServiceKeys should return before the 10s deadline")
+
+	expectedKeys := []string{
+		constant.DEFAULT_NAMESPACE_ID + constant.SERVICE_INFO_SPLITER + constant.DEFAULT_GROUP + constant.SERVICE_INFO_SPLITER + serviceName1,
+		constant.DEFAULT_NAMESPACE_ID + constant.SERVICE_INFO_SPLITER + constant.DEFAULT_GROUP + constant.SERVICE_INFO_SPLITER + serviceName2,
+	}
+	assert.ElementsMatch(t, expectedKeys, keys, "MatchedServiceKeys should return exactly the two pre-registered matching services")
+}
+
+// TestIntegrationNamingFuzzyWatchNotSupportedOnV2 exercises the fast-fail
+// path when the connected server does not advertise the fuzzyWatch ability
+// (2.x servers, #859): FuzzyWatch must return a nil handle and an error
+// satisfying errors.Is(err, naming_cache.ErrFuzzyWatchNotSupported), never a
+// silently accepted registration that then never delivers anything.
+func TestIntegrationNamingFuzzyWatchNotSupportedOnV2(t *testing.T) {
+	param, ok := fuzzyWatchV2ClientParam(t)
+	if !ok {
+		t.Skip("no nacos 2.x server available (neither the suite default nor NACOS2_SERVER_IP/NACOS2_SERVER_PORT)")
+	}
+
+	client, err := clients.NewNamingClient(param)
+	require.NoError(t, err, "create naming client against nacos 2.x")
+	defer client.CloseClient()
+
+	handle, err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "fuzzy-svc-notsupported-*",
+		GroupNamePattern:   constant.DEFAULT_GROUP,
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	})
+	assert.Nil(t, handle, "handle should be nil when the server does not support fuzzy watch")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, naming_cache.ErrFuzzyWatchNotSupported),
+		"error should be ErrFuzzyWatchNotSupported, got: %v", err)
 }
