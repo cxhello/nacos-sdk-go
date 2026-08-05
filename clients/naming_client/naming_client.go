@@ -407,8 +407,10 @@ func (sc *NamingClient) Unsubscribe(param *vo.SubscribeParam) (err error) {
 // FuzzyWatch registers a fuzzy watch on services matching the given patterns
 // and returns a handle identifying this registration. Registration is a
 // local operation: the server-side watch is established and maintained by a
-// background reconcile worker, so the returned error only reflects parameter
-// validation and server capability - never a transient RPC outcome. Capacity
+// background reconcile worker, so the returned error only ever reflects
+// parameter validation, ErrFuzzyWatchClientClosed (the client has already
+// been shut down), or ErrFuzzyWatchNotSupported (the connected server lacks
+// the fuzzyWatch ability) - never a transient RPC outcome. Capacity
 // rejections from the server are delivered through param.OnLoadEvent.
 func (sc *NamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) (*FuzzyWatchHandle, error) {
 	if param.ServiceNamePattern == "" {

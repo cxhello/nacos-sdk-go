@@ -239,6 +239,28 @@ func TestRegisterFailsFastWhenAbilityMissing(t *testing.T) {
 	assert.False(t, ok)
 }
 
+// After Shutdown, RegisterWatcher must reject with ErrFuzzyWatchClientClosed
+// instead of returning a handle whose watch can never be established (the
+// reconcile worker is stopped). A registration made before Shutdown must
+// still have succeeded, and the post-Shutdown call must create no new
+// pattern.
+func TestRegisterFailsAfterShutdown(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	id, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	require.NoError(t, err)
+	require.NotZero(t, id)
+	mustWatchCall(t, r)
+
+	h.Shutdown()
+
+	_, err = h.RegisterWatcher("public>>g>>other*", func(model.FuzzyWatchChangeEvent) {}, nil)
+	assert.ErrorIs(t, err, ErrFuzzyWatchClientClosed)
+	_, ok := h.get("public>>g>>other*")
+	assert.False(t, ok, "a rejected registration must not create pattern state")
+}
+
 // Regression for the lost-CANCEL race: a WATCH already in flight when the
 // last watcher is removed must not clobber the pending CANCEL. The
 // fakeRequester is armed to block the WATCH call after it is recorded (so

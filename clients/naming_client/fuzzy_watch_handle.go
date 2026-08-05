@@ -23,6 +23,13 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 )
 
+// Sentinel errors returned by INamingClient.FuzzyWatch, re-exported so
+// callers can errors.Is them without importing the internal cache package.
+var (
+	ErrFuzzyWatchNotSupported = naming_cache.ErrFuzzyWatchNotSupported
+	ErrFuzzyWatchClientClosed = naming_cache.ErrFuzzyWatchClientClosed
+)
+
 // FuzzyWatchHandle identifies one FuzzyWatch registration. Cancellation is
 // watcher-scoped: Cancel removes only this registration, and the server-side
 // watch is torn down by the reconcile worker after the pattern's last

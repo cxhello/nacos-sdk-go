@@ -17,15 +17,25 @@
 package naming_client
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 )
+
+// The naming_client-level sentinels must be the exact same error values as
+// their naming_cache originals, so a caller can errors.Is against the
+// re-export without importing the internal cache package.
+func TestFuzzyWatchSentinelErrorsAreReExported(t *testing.T) {
+	assert.True(t, errors.Is(ErrFuzzyWatchNotSupported, naming_cache.ErrFuzzyWatchNotSupported))
+	assert.True(t, errors.Is(ErrFuzzyWatchClientClosed, naming_cache.ErrFuzzyWatchClientClosed))
+}
 
 // fakeRequesterForClient is a minimal naming_cache.FuzzyWatchRequester for
 // handle-level tests: it always reports fuzzy watch as supported and never

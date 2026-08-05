@@ -33,7 +33,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/clients"
-	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
+	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
@@ -667,7 +667,7 @@ func TestFuzzyWatchMatchedServiceKeysIntegration(t *testing.T) {
 // TestIntegrationNamingFuzzyWatchNotSupportedOnV2 exercises the fast-fail
 // path when the connected server does not advertise the fuzzyWatch ability
 // (2.x servers, #859): FuzzyWatch must return a nil handle and an error
-// satisfying errors.Is(err, naming_cache.ErrFuzzyWatchNotSupported), never a
+// satisfying errors.Is(err, naming_client.ErrFuzzyWatchNotSupported), never a
 // silently accepted registration that then never delivers anything.
 func TestIntegrationNamingFuzzyWatchNotSupportedOnV2(t *testing.T) {
 	param, ok := fuzzyWatchV2ClientParam(t)
@@ -686,6 +686,6 @@ func TestIntegrationNamingFuzzyWatchNotSupportedOnV2(t *testing.T) {
 	})
 	assert.Nil(t, handle, "handle should be nil when the server does not support fuzzy watch")
 	require.Error(t, err)
-	assert.True(t, errors.Is(err, naming_cache.ErrFuzzyWatchNotSupported),
+	assert.True(t, errors.Is(err, naming_client.ErrFuzzyWatchNotSupported),
 		"error should be ErrFuzzyWatchNotSupported, got: %v", err)
 }

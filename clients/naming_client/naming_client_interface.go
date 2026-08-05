@@ -112,9 +112,11 @@ type INamingClient interface {
 	// FuzzyWatch use to watch add/delete of services matching a pattern.
 	// Registration is local: the returned handle's server-side watch is
 	// established and kept in sync by a background reconcile worker, so an
-	// error here reflects only parameter validation or missing server
-	// capability, never a transient RPC outcome. Cancel the watch with
-	// handle.Cancel(); it is scoped to this registration only.
+	// error here reflects only parameter validation, ErrFuzzyWatchClientClosed
+	// (the client has already been shut down), or ErrFuzzyWatchNotSupported
+	// (the connected server lacks the fuzzyWatch ability) - never a transient
+	// RPC outcome. Cancel the watch with handle.Cancel(); it is scoped to this
+	// registration only.
 	// ServiceNamePattern require, supports five modes: exact ("order"),
 	//   match-all ("*"), prefix ("order*"), suffix ("*order"), contains ("*order*")
 	// GroupNamePattern optional,default:DEFAULT_GROUP

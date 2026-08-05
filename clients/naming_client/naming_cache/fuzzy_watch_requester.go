@@ -48,3 +48,8 @@ type FuzzyWatchRequester interface {
 // ErrFuzzyWatchNotSupported is returned by RegisterWatcher when the connected
 // server does not advertise the fuzzyWatch ability (2.x servers).
 var ErrFuzzyWatchNotSupported = errors.New("fuzzy watch is not supported by the connected nacos server (requires nacos 3.x)")
+
+// ErrFuzzyWatchClientClosed is returned by RegisterWatcher after the client's
+// Shutdown has run: the reconcile worker is stopped, so a new watch could
+// never be established.
+var ErrFuzzyWatchClientClosed = errors.New("fuzzy watch rejected: the nacos client is already closed")

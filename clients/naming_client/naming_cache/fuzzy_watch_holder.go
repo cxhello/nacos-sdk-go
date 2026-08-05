@@ -447,6 +447,11 @@ func (h *FuzzyWatchServiceListHolder) RegisterWatcher(pattern string, cb func(mo
 	if cb == nil {
 		return 0, errors.New("watchCallback cannot be nil!")
 	}
+	select {
+	case <-h.stopCh:
+		return 0, ErrFuzzyWatchClientClosed
+	default:
+	}
 	r := h.getRequester()
 	if r == nil || !r.ServerSupportsFuzzyWatch() {
 		return 0, ErrFuzzyWatchNotSupported
