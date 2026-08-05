@@ -17,16 +17,21 @@
 package rpc_request
 
 import (
+	"encoding/json"
 	"testing"
 
-	"github.com/nacos-group/nacos-sdk-proto/go/naming"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 )
 
-func TestNamingFuzzyWatchRequestProtoMessage(t *testing.T) {
+// TestNamingFuzzyWatchRequestWireBody pins the legacy JSON body's field name
+// for the initializing flag: the server's Jackson binding derives the
+// property "initializing" from the boolean isInitializing bean (no
+// @JsonProperty override), so the body must use that name, never
+// "isInitializing" - see the struct doc comment on NamingFuzzyWatchRequest.
+func TestNamingFuzzyWatchRequestWireBody(t *testing.T) {
 	r := NewNamingFuzzyWatchRequest("ns", "public>>g*>>svc*", constant.FUZZY_WATCH_TYPE_WATCH,
 		[]string{"public@@g@@svc1", "public@@g@@svc2"}, true)
 	r.RequestId = "1"
@@ -34,22 +39,28 @@ func TestNamingFuzzyWatchRequestProtoMessage(t *testing.T) {
 	assert.Equal(t, constant.FUZZY_WATCH_REQUEST_NAME, r.GetRequestType())
 	assert.Equal(t, "NamingFuzzyWatchRequest", r.GetRequestType())
 
-	msg, ok := r.ProtoMessage().(*naming.NamingFuzzyWatchRequest)
-	require.True(t, ok)
-	assert.Equal(t, "1", msg.RequestId)
-	assert.True(t, msg.IsInitializing)
-	assert.Equal(t, "ns", msg.Namespace)
-	assert.Equal(t, "public>>g*>>svc*", msg.GroupKeyPattern)
-	assert.Equal(t, []string{"public@@g@@svc1", "public@@g@@svc2"}, msg.ReceivedGroupKeys)
-	assert.Equal(t, "WATCH", msg.WatchType)
+	body := r.GetBody(r)
+	var decoded map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(body), &decoded))
+
+	assert.Equal(t, true, decoded["initializing"], "wire body must carry the flag under its Jackson-derived name")
+	_, hasLegacyName := decoded["isInitializing"]
+	assert.False(t, hasLegacyName, "wire body must not carry the flag under the discarded proto json_name")
+	assert.Equal(t, "1", decoded["requestId"])
+	assert.Equal(t, "ns", decoded["namespace"])
+	assert.Equal(t, "public>>g*>>svc*", decoded["groupKeyPattern"])
+	assert.Equal(t, []interface{}{"public@@g@@svc1", "public@@g@@svc2"}, decoded["receivedGroupKeys"])
+	assert.Equal(t, "WATCH", decoded["watchType"])
 }
 
-func TestNamingFuzzyWatchRequestProtoMessage_CancelWatch(t *testing.T) {
+func TestNamingFuzzyWatchRequestWireBody_CancelWatch(t *testing.T) {
 	r := NewNamingFuzzyWatchRequest("ns", "public>>g*>>svc*", constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, nil, false)
-	msg, ok := r.ProtoMessage().(*naming.NamingFuzzyWatchRequest)
-	require.True(t, ok)
-	assert.Equal(t, "CANCEL_WATCH", msg.WatchType)
-	assert.False(t, msg.IsInitializing)
+
+	var decoded map[string]interface{}
+	require.NoError(t, json.Unmarshal([]byte(r.GetBody(r)), &decoded))
+
+	assert.Equal(t, "CANCEL_WATCH", decoded["watchType"])
+	assert.Equal(t, false, decoded["initializing"])
 }
 
 func TestNamingFuzzyWatchRequestGetStringToSign(t *testing.T) {
