@@ -20,18 +20,23 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/nacos-group/nacos-sdk-proto/go/naming"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 )
 
 // NamingFuzzyWatchRequest is the client-initiated request that (un)registers
-// a fuzzy watch pattern with the server. It is sent as the legacy JSON body,
-// not a proto message: the server deserializes it with Jackson into
+// a fuzzy watch pattern with the server. The server deserializes it with
+// Jackson into
 // com.alibaba.nacos.api.naming.remote.request.NamingFuzzyWatchRequest, whose
 // boolean field isInitializing has no @JsonProperty override, so Jackson's
 // bean-property convention derives the wire name "initializing" (the "is"
-// prefix is stripped for boolean getters/setters). The proto definition's
-// json_name is fixed as "isInitializing" and cannot be overridden per-field,
-// so this request does not implement codec.ProtoConvertible.
+// prefix is stripped for boolean getters/setters). nacos-sdk-proto now
+// carries an explicit json_name=initializing for the matching proto field
+// (see ProtoMessage below), so this request can go through the normal proto
+// encoding path. The legacy JSON tag below keeps the corrected field name
+// as well, in case the fallback body is ever used.
 type NamingFuzzyWatchRequest struct {
 	*Request
 	IsInitializing    bool     `json:"initializing"`
@@ -67,6 +72,17 @@ func (r *NamingFuzzyWatchRequest) GetRequestType() string {
 // service/group pair, so there is nothing to sign beyond the timestamp.
 func (r *NamingFuzzyWatchRequest) GetStringToSign() string {
 	return strconv.FormatInt(time.Now().Unix()*1000, 10)
+}
+
+func (r *NamingFuzzyWatchRequest) ProtoMessage() proto.Message {
+	return &naming.NamingFuzzyWatchRequest{
+		RequestId:         r.RequestId,
+		IsInitializing:    r.IsInitializing,
+		Namespace:         r.Namespace,
+		GroupKeyPattern:   r.GroupKeyPattern,
+		ReceivedGroupKeys: r.ReceivedGroupKeys,
+		WatchType:         r.WatchType,
+	}
 }
 
 // NamingFuzzyWatchSyncContext mirrors sdk-proto's

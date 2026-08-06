@@ -20,24 +20,76 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/nacos-group/nacos-sdk-proto/go/naming"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 )
 
-// TestNamingFuzzyWatchRequestWireBody pins the legacy JSON body's field name
-// for the initializing flag: the server's Jackson binding derives the
-// property "initializing" from the boolean isInitializing bean (no
-// @JsonProperty override), so the body must use that name, never
-// "isInitializing" - see the struct doc comment on NamingFuzzyWatchRequest.
-func TestNamingFuzzyWatchRequestWireBody(t *testing.T) {
+func TestNamingFuzzyWatchRequestProtoMessage(t *testing.T) {
 	r := NewNamingFuzzyWatchRequest("ns", "public>>g*>>svc*", constant.FUZZY_WATCH_TYPE_WATCH,
 		[]string{"public@@g@@svc1", "public@@g@@svc2"}, true)
 	r.RequestId = "1"
 
 	assert.Equal(t, constant.FUZZY_WATCH_REQUEST_NAME, r.GetRequestType())
 	assert.Equal(t, "NamingFuzzyWatchRequest", r.GetRequestType())
+
+	msg, ok := r.ProtoMessage().(*naming.NamingFuzzyWatchRequest)
+	require.True(t, ok)
+	assert.Equal(t, "1", msg.RequestId)
+	assert.True(t, msg.IsInitializing)
+	assert.Equal(t, "ns", msg.Namespace)
+	assert.Equal(t, "public>>g*>>svc*", msg.GroupKeyPattern)
+	assert.Equal(t, []string{"public@@g@@svc1", "public@@g@@svc2"}, msg.ReceivedGroupKeys)
+	assert.Equal(t, "WATCH", msg.WatchType)
+}
+
+func TestNamingFuzzyWatchRequestProtoMessage_CancelWatch(t *testing.T) {
+	r := NewNamingFuzzyWatchRequest("ns", "public>>g*>>svc*", constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, nil, false)
+	msg, ok := r.ProtoMessage().(*naming.NamingFuzzyWatchRequest)
+	require.True(t, ok)
+	assert.Equal(t, "CANCEL_WATCH", msg.WatchType)
+	assert.False(t, msg.IsInitializing)
+}
+
+// TestNamingFuzzyWatchRequestProtoWireName pins the wire name the proto
+// encoding path actually puts on the flag, mirroring
+// codec.PayloadCodec.Encode (protojson.MarshalOptions{EmitDefaultValues:
+// true}.Marshal on ProtoMessage()). nacos-sdk-proto beta.9 added an explicit
+// json_name=initializing to the proto field, matching the server's
+// Jackson-derived property name - see the struct doc comment on
+// NamingFuzzyWatchRequest. Before that, protojson emitted "isInitializing"
+// and the server silently dropped the flag.
+func TestNamingFuzzyWatchRequestProtoWireName(t *testing.T) {
+	r := NewNamingFuzzyWatchRequest("ns", "public>>g*>>svc*", constant.FUZZY_WATCH_TYPE_WATCH,
+		[]string{"public@@g@@svc1", "public@@g@@svc2"}, true)
+	r.RequestId = "1"
+
+	jsonBytes, err := protojson.MarshalOptions{EmitDefaultValues: true}.Marshal(r.ProtoMessage())
+	require.NoError(t, err)
+
+	body := string(jsonBytes)
+	assert.Contains(t, body, `"initializing"`, "proto-encoded payload must carry the flag under its Jackson-derived name")
+	assert.NotContains(t, body, `"isInitializing"`, "proto-encoded payload must not carry the flag under the discarded default json name")
+
+	var decoded map[string]interface{}
+	require.NoError(t, json.Unmarshal(jsonBytes, &decoded))
+	assert.Equal(t, true, decoded["initializing"])
+}
+
+// TestNamingFuzzyWatchRequestWireBody pins the legacy JSON body's field name
+// for the initializing flag: the server's Jackson binding derives the
+// property "initializing" from the boolean isInitializing bean (no
+// @JsonProperty override), so the body must use that name, never
+// "isInitializing" - see the struct doc comment on NamingFuzzyWatchRequest.
+// This is the fallback path if proto encoding is ever bypassed, so it is
+// pinned independently of TestNamingFuzzyWatchRequestProtoWireName above.
+func TestNamingFuzzyWatchRequestWireBody(t *testing.T) {
+	r := NewNamingFuzzyWatchRequest("ns", "public>>g*>>svc*", constant.FUZZY_WATCH_TYPE_WATCH,
+		[]string{"public@@g@@svc1", "public@@g@@svc2"}, true)
+	r.RequestId = "1"
 
 	body := r.GetBody(r)
 	var decoded map[string]interface{}

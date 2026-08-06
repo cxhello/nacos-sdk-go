@@ -14,7 +14,7 @@ require (
 	github.com/aliyun/credentials-go v1.4.3
 	github.com/buger/jsonparser v1.1.1
 	github.com/golang/mock v1.6.0
-	github.com/nacos-group/nacos-sdk-proto/go v1.0.0-beta.8
+	github.com/nacos-group/nacos-sdk-proto/go v1.0.0-beta.9
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.12.2
 	github.com/stretchr/testify v1.8.1
