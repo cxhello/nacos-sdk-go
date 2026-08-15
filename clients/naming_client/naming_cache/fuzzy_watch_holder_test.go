@@ -518,6 +518,46 @@ func TestCallbackPanicIsIsolated(t *testing.T) {
 	}
 }
 
+// TestCancelInvalidatesQueuedCallbacks asserts that a task already sitting in
+// the dispatch queue when its watcher is removed must not invoke that watcher
+// afterward: a callback mid-flight cannot be recalled, but SDK-owned pending
+// work must observe the cancellation. Sequence: the first delivery blocks the
+// drain goroutine inside the callback, a second event is enqueued behind it,
+// the watcher is removed, and the first delivery is released - the queued
+// second task must then be skipped.
+func TestCancelInvalidatesQueuedCallbacks(t *testing.T) {
+	h := NewFuzzyWatchServiceListHolder("public")
+	h.SetRequester(newFakeRequester())
+	var count atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	id, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {
+		count.Add(1)
+		entered <- struct{}{}
+		<-release
+	}, nil)
+	require.NoError(t, err)
+
+	h.HandleChangeNotify("public@@g@@svc1", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first delivery never started")
+	}
+	h.HandleChangeNotify("public@@g@@svc2", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	h.RemoveWatcherByID("public>>g>>svc*", id)
+	close(release)
+
+	ctx, ok := h.get("public>>g>>svc*")
+	require.True(t, ok, "pattern state stays until the worker confirms the CANCEL")
+	waitFor(t, func() bool {
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		return !ctx.draining && len(ctx.pending) == 0
+	})
+	assert.Equal(t, int32(1), count.Load(), "a task queued before Cancel must not invoke the removed watcher")
+}
+
 // TestPendingQueueIsBounded asserts that the per-pattern dispatch queue does
 // not grow without bound when a callback stalls the drain goroutine: once
 // pendingLimit is reached, further notifications are dropped (logged, not

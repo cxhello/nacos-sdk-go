@@ -35,8 +35,14 @@ func (h *FuzzyWatchServiceListHolder) Start() {
 	go h.loop()
 }
 
-// Shutdown stops the reconcile worker goroutine. Idempotent.
+// Shutdown stops the reconcile worker goroutine. Idempotent. Closing stopCh
+// under h.mu is what linearizes shutdown with RegisterWatcher's commit: a
+// registration that re-checks stopCh while holding h.mu either observes the
+// close (and rejects) or commits strictly before it - a plain channel/atomic
+// check without the shared lock would leave a check-to-commit window.
 func (h *FuzzyWatchServiceListHolder) Shutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.stopOnce.Do(func() { close(h.stopCh) })
 }
 

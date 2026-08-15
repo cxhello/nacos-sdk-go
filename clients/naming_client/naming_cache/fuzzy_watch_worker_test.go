@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,6 +56,13 @@ type fakeRequester struct {
 	// calls it armed for blocking.
 	blockCalls int
 	release    chan struct{}
+
+	// abilityGate/abilityEntered pause ServerSupportsFuzzyWatch the same way:
+	// the call signals abilityEntered (so the test knows registration reached
+	// the ability check) and then blocks until abilityGate is closed, letting
+	// the test interleave Shutdown with an in-flight ability check.
+	abilityGate    chan struct{}
+	abilityEntered chan struct{}
 }
 
 func newFakeRequester() *fakeRequester {
@@ -83,7 +91,18 @@ func (f *fakeRequester) SendFuzzyWatchRequest(pattern, watchType string, keys []
 	return err
 }
 
-func (f *fakeRequester) ServerSupportsFuzzyWatch() bool { return f.supported }
+func (f *fakeRequester) ServerSupportsFuzzyWatch() bool {
+	f.mu.Lock()
+	gate, entered := f.abilityGate, f.abilityEntered
+	f.mu.Unlock()
+	if entered != nil {
+		entered <- struct{}{}
+	}
+	if gate != nil {
+		<-gate
+	}
+	return f.supported
+}
 
 type fakeClock struct {
 	mu  sync.Mutex
@@ -259,6 +278,99 @@ func TestRegisterFailsAfterShutdown(t *testing.T) {
 	assert.ErrorIs(t, err, ErrFuzzyWatchClientClosed)
 	_, ok := h.get("public>>g>>other*")
 	assert.False(t, ok, "a rejected registration must not create pattern state")
+}
+
+// A Shutdown that lands while RegisterWatcher is blocked inside the ability
+// check (which may take up to its network timeout) must not let the
+// registration commit afterward: the reconcile worker is already gone, so a
+// committed watcher would be a ghost handle that can never establish a
+// server-side WATCH. The registration must observe the closed state at commit
+// time and reject with ErrFuzzyWatchClientClosed, creating no pattern state.
+func TestShutdownDuringAbilityCheckRejectsRegistration(t *testing.T) {
+	r := newFakeRequester()
+	r.abilityGate = make(chan struct{})
+	r.abilityEntered = make(chan struct{}, 1)
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+
+	type result struct {
+		id  uint64
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		id, err := h.RegisterWatcher("public>>g>>svc*", func(model.FuzzyWatchChangeEvent) {}, nil)
+		done <- result{id, err}
+	}()
+
+	select {
+	case <-r.abilityEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("registration never reached the ability check")
+	}
+	h.Shutdown()
+	close(r.abilityGate)
+
+	select {
+	case res := <-done:
+		assert.ErrorIs(t, res.err, ErrFuzzyWatchClientClosed)
+		assert.Zero(t, res.id)
+	case <-time.After(2 * time.Second):
+		t.Fatal("registration did not return")
+	}
+	_, ok := h.get("public>>g>>svc*")
+	assert.False(t, ok, "a registration racing Shutdown must not create pattern state")
+}
+
+// A callback that panics must not be treated as delivered: its syncedKeys must
+// not record the key, so the reconcile worker's next diff-sync pass re-delivers
+// the event. (Java parity: syncServiceKeys is updated only after onEvent
+// returns normally.)
+func TestPanickingCallbackIsRetriedByDiffSync(t *testing.T) {
+	r := newFakeRequester()
+	h := newTestWorkerHolder(t, r, &fakeClock{now: time.Unix(0, 0)})
+	var calls atomic.Int32
+	events := make(chan model.FuzzyWatchChangeEvent, 4)
+	h.RegisterWatcher("public>>g>>svc*", func(ev model.FuzzyWatchChangeEvent) {
+		if calls.Add(1) == 1 {
+			panic("boom")
+		}
+		events <- ev
+	}, nil)
+	mustWatchCall(t, r)
+	waitFor(t, func() bool {
+		ctx, ok := h.get("public>>g>>svc*")
+		if !ok {
+			return false
+		}
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		return ctx.consistentWithServer
+	})
+
+	h.HandleChangeNotify("public@@g@@svc1", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	waitFor(t, func() bool { return calls.Load() >= 1 })
+
+	select {
+	case ev := <-events:
+		assert.Equal(t, "svc1", ev.ServiceName)
+		assert.Equal(t, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, ev.SyncType)
+	case <-time.After(2 * time.Second):
+		t.Fatal("panicked delivery was marked synced, diff-sync never retried it")
+	}
+	// The successful retry is what marks the key delivered.
+	waitFor(t, func() bool {
+		ctx, ok := h.get("public>>g>>svc*")
+		if !ok {
+			return false
+		}
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		if len(ctx.entries) != 1 {
+			return false
+		}
+		_, seen := ctx.entries[0].syncedKeys["public@@g@@svc1"]
+		return seen
+	})
 }
 
 // Regression for the lost-CANCEL race: a WATCH already in flight when the

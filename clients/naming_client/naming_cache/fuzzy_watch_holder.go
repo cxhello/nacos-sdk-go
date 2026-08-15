@@ -50,6 +50,15 @@ type watcherEntry struct {
 	onLoadEvent func(model.FuzzyWatchLoadEvent) // nil until the reconcile worker wires it
 	syncedKeys  map[string]struct{}             // guarded by ctx.mu
 	syncVersion uint64
+
+	// removed flips true when RemoveWatcherByID takes this entry out of
+	// ctx.entries (guarded by ctx.mu). notifyTask snapshots entry pointers at
+	// enqueue time, so a task can still be sitting in the dispatch queue when
+	// its watcher is canceled; deliver re-checks this flag immediately before
+	// invoking the callback so SDK-owned pending work never invokes a
+	// registration after cancellation returned. A callback already executing
+	// cannot be recalled - only queued, not-yet-started deliveries are cut off.
+	removed bool
 }
 
 // notifyTask bundles one fired event (or, once the reconcile worker is
@@ -232,7 +241,10 @@ func (c *fuzzyWatchContext) deliver(task notifyTask) {
 	}
 	for _, entry := range task.targets {
 		if task.loadEvent != nil {
-			if entry.onLoadEvent != nil {
+			c.mu.Lock()
+			removed := entry.removed
+			c.mu.Unlock()
+			if !removed && entry.onLoadEvent != nil {
 				safeInvoke(func() { entry.onLoadEvent(*task.loadEvent) })
 			}
 			continue
@@ -240,20 +252,28 @@ func (c *fuzzyWatchContext) deliver(task notifyTask) {
 		ev := *task.event
 		key := buildServiceKey(ev.NamespaceId, ev.GroupName, ev.ServiceName)
 		c.mu.Lock()
-		var skip bool
-		switch ev.ChangedType {
-		case constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE:
-			_, seen := entry.syncedKeys[key]
-			skip = seen
-		case constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE:
-			_, seen := entry.syncedKeys[key]
-			skip = !seen
+		skip := entry.removed
+		if !skip {
+			switch ev.ChangedType {
+			case constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE:
+				_, seen := entry.syncedKeys[key]
+				skip = seen
+			case constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE:
+				_, seen := entry.syncedKeys[key]
+				skip = !seen
+			}
 		}
 		c.mu.Unlock()
 		if skip {
 			continue
 		}
-		safeInvoke(func() { entry.fn(ev) })
+		// syncedKeys only advances when the callback completed normally: a
+		// panicking callback leaves the key unsynced so the reconcile worker's
+		// next diff-sync pass re-delivers it (Java parity: syncServiceKeys is
+		// updated only after onEvent returns).
+		if !safeInvoke(func() { entry.fn(ev) }) {
+			continue
+		}
 		c.mu.Lock()
 		switch ev.ChangedType {
 		case constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE:
@@ -266,14 +286,17 @@ func (c *fuzzyWatchContext) deliver(task notifyTask) {
 }
 
 // safeInvoke isolates user-callback panics: a panicking watcher must not kill
-// the process or starve other watchers sharing the drain goroutine.
-func safeInvoke(fn func()) {
+// the process or starve other watchers sharing the drain goroutine. It reports
+// whether fn completed without panicking, so deliver can withhold the
+// delivered-state update for a failed callback.
+func safeInvoke(fn func()) (completed bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			logger.Errorf("fuzzy watch callback panic recovered: %v\n%s", r, string(debug.Stack()))
 		}
 	}()
 	fn()
+	return true
 }
 
 func buildServiceKey(namespace, group, service string) string {
@@ -447,6 +470,9 @@ func (h *FuzzyWatchServiceListHolder) RegisterWatcher(pattern string, cb func(mo
 	if cb == nil {
 		return 0, errors.New("watchCallback cannot be nil!")
 	}
+	// Fast-fail before the ability check, which may block for its network
+	// timeout; the authoritative closed-state check is the one below, made
+	// under h.mu after the ability check returns.
 	select {
 	case <-h.stopCh:
 		return 0, ErrFuzzyWatchClientClosed
@@ -457,6 +483,17 @@ func (h *FuzzyWatchServiceListHolder) RegisterWatcher(pattern string, cb func(mo
 		return 0, ErrFuzzyWatchNotSupported
 	}
 	h.mu.Lock()
+	// Shutdown closes stopCh while holding h.mu, so this re-check linearizes
+	// the registration commit with shutdown: without it, a Shutdown landing
+	// during the ability check above would let a watcher commit after the
+	// reconcile worker is already gone - a ghost handle that can never
+	// establish a server-side WATCH.
+	select {
+	case <-h.stopCh:
+		h.mu.Unlock()
+		return 0, ErrFuzzyWatchClientClosed
+	default:
+	}
 	var ctx *fuzzyWatchContext
 	if v, ok := h.patterns.Get(pattern); ok {
 		ctx = v.(*fuzzyWatchContext)
@@ -505,6 +542,10 @@ func (h *FuzzyWatchServiceListHolder) RemoveWatcherByID(pattern string, id uint6
 	for _, e := range ctx.entries {
 		if e.id != id {
 			kept = append(kept, e)
+		} else {
+			// Tasks already queued hold a pointer to this entry; marking it
+			// removed is what stops deliver from invoking it later.
+			e.removed = true
 		}
 	}
 	ctx.entries = kept
