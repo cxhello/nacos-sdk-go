@@ -584,6 +584,92 @@ func TestPendingQueueIsBounded(t *testing.T) {
 	close(block)
 }
 
+// TestQueueDropsHealEvenWhenReconcileRunsMidDrain reproduces the P1 from
+// review: while a drain is in flight, entry.syncedKeys is only an
+// intermediate delivery state, so a reconcile pass that sees an empty diff
+// mid-drain must not stamp the watcher's syncVersion as current. Sequence:
+// an ADD blocks in the callback (syncedKeys not yet updated), a second ADD
+// fills the bounded queue, two DELETEs revert receivedGroupKeys to empty but
+// their tasks are dropped by the full queue. A reconcile pass at that moment
+// sees both key sets empty; if it stamps the version, the post-drain pass
+// skips the watcher and the dropped DELETEs are never replayed - breaking
+// the guarantee that queue drops are healed by diff-sync.
+func TestQueueDropsHealEvenWhenReconcileRunsMidDrain(t *testing.T) {
+	h := NewFuzzyWatchServiceListHolder("public")
+	h.SetRequester(newFakeRequester())
+	h.pendingLimitForTest(1)
+
+	sink := &eventSink{}
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	h.RegisterWatcher("public>>g>>svc*", func(ev model.FuzzyWatchChangeEvent) {
+		sink.cb(ev)
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-release
+		}
+	}, nil)
+	ctx, ok := h.get("public>>g>>svc*")
+	require.True(t, ok)
+
+	// ADD svc1 starts delivering and blocks inside the callback, before
+	// deliver records the key in syncedKeys.
+	h.HandleChangeNotify("public@@g@@svc1", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first ADD delivery never started")
+	}
+	// ADD svc2 fills the bounded queue (limit 1).
+	h.HandleChangeNotify("public@@g@@svc2", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	// Both DELETEs revert receivedGroupKeys to empty; their tasks are
+	// dropped because the queue is full.
+	h.HandleChangeNotify("public@@g@@svc1", constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE)
+	h.HandleChangeNotify("public@@g@@svc2", constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE)
+
+	// Reconcile pass mid-drain: receivedGroupKeys and syncedKeys are both
+	// (transiently) empty, so the diff is empty. This must NOT stamp the
+	// watcher's syncVersion, because deliveries are still in flight.
+	ctx.mu.Lock()
+	require.True(t, ctx.draining, "drain must still be in flight for this scenario")
+	require.Empty(t, ctx.receivedGroupKeys)
+	require.Empty(t, ctx.entries[0].syncedKeys)
+	ctx.enqueueLocked(ctx.syncWatchersLocked()...)
+	ctx.mu.Unlock()
+
+	// Let the blocked ADD and the queued ADD deliver; syncedKeys now holds
+	// both keys while receivedGroupKeys is empty.
+	close(release)
+	waitFor(t, func() bool {
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		return !ctx.draining && len(ctx.pending) == 0
+	})
+
+	// Subsequent reconcile passes must replay the dropped DELETEs as
+	// diff-sync events and converge syncedKeys back to empty. Passes are
+	// repeated like the bell-driven worker would (a diff task can itself be
+	// dropped by the tight limit-1 queue; onDrop rings the bell and the next
+	// pass heals the remainder).
+	waitFor(t, func() bool {
+		ctx.mu.Lock()
+		defer ctx.mu.Unlock()
+		if !ctx.draining {
+			ctx.enqueueLocked(ctx.syncWatchersLocked()...)
+		}
+		return len(ctx.entries[0].syncedKeys) == 0
+	})
+	var deletes int
+	for _, e := range sink.snapshot() {
+		if e.ChangedType == constant.FUZZY_WATCH_CHANGED_TYPE_DELETE_SERVICE {
+			deletes++
+			assert.Equal(t, constant.FUZZY_WATCH_DIFF_SYNC_NOTIFY, e.SyncType)
+		}
+	}
+	assert.Equal(t, 2, deletes, "both dropped DELETEs must be replayed by diff-sync")
+}
+
 // TestDeliverySkipsPerWatcherDuplicates asserts that deliver's per-watcher
 // skip decision is driven by each watcher's own syncedKeys, not just
 // pattern-level receivedGroupKeys: a manually queued duplicate ADD task

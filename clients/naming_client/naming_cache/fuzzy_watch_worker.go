@@ -216,7 +216,12 @@ func (c *fuzzyWatchContext) syncWatchersLocked() []notifyTask {
 				}
 			}
 		}
-		if len(diff) == 0 {
+		// While a drain is in flight, syncedKeys is only an intermediate
+		// delivery state: queued or in-flight callbacks will still mutate it
+		// after we release c.mu. An empty diff observed mid-drain therefore
+		// proves nothing - stamping here would let dropped DELETE/ADD tasks
+		// escape all future diff-sync passes. Stamp only at rest.
+		if len(diff) == 0 && !c.draining {
 			entry.syncVersion = c.syncVersion
 		} else {
 			tasks = append(tasks, diff...)
