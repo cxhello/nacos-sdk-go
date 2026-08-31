@@ -17,6 +17,9 @@ type mockConn struct {
 	serverInfo ServerInfo
 	abandoned  bool
 	closed     bool
+
+	abilityMu    sync.RWMutex
+	abilityTable map[string]bool
 }
 
 func (m *mockConn) request(request rpc_request.IRequest, timeoutMills int64, client *RpcClient) (rpc_response.IResponse, error) {
@@ -27,6 +30,16 @@ func (m *mockConn) getConnectionId() string   { return m.id }
 func (m *mockConn) getServerInfo() ServerInfo { return m.serverInfo }
 func (m *mockConn) setAbandon(flag bool)      { m.abandoned = flag }
 func (m *mockConn) getAbandon() bool          { return m.abandoned }
+func (m *mockConn) setAbilityTable(table map[string]bool) {
+	m.abilityMu.Lock()
+	defer m.abilityMu.Unlock()
+	m.abilityTable = table
+}
+func (m *mockConn) getAbilityTable() (map[string]bool, bool) {
+	m.abilityMu.RLock()
+	defer m.abilityMu.RUnlock()
+	return m.abilityTable, m.abilityTable != nil
+}
 
 // --- Unit Tests for GetCurrentConnection / SetCurrentConnection ---
 

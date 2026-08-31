@@ -97,3 +97,14 @@ type SelectOneHealthInstanceParam struct {
 	ServiceName string   `param:"serviceName"` //required
 	GroupName   string   `param:"groupName"`   //optional,default:DEFAULT_GROUP
 }
+
+// FuzzyWatchParam registers a fuzzy watch on every service whose name and
+// group match the given patterns. Each pattern supports five modes: exact
+// ("order"), match-all ("*"), prefix ("order*"), suffix ("*order") and
+// contains ("*order*").
+type FuzzyWatchParam struct {
+	ServiceNamePattern string                                  `param:"serviceNamePattern"` //required
+	GroupNamePattern   string                                  `param:"groupNamePattern"`   //optional,default:DEFAULT_GROUP
+	WatchCallback      func(event model.FuzzyWatchChangeEvent) //required; fires on every add/delete for a matched service
+	OnLoadEvent        func(event model.FuzzyWatchLoadEvent)   //optional; called when the server reports the pattern hit a capacity limit (pattern count / matched-service count). nil means the rejection is only logged.
+}

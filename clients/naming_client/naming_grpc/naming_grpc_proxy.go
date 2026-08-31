@@ -37,6 +37,8 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
 )
 
+var _ naming_cache.FuzzyWatchRequester = (*NamingGrpcProxy)(nil)
+
 // NamingGrpcProxy ...
 type NamingGrpcProxy struct {
 	clientConfig      constant.ClientConfig
@@ -44,6 +46,7 @@ type NamingGrpcProxy struct {
 	rpcClient         rpc.IRpcClient
 	eventListener     *ConnectionEventListener
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	fuzzyWatchHolder  *naming_cache.FuzzyWatchServiceListHolder
 	// send performs the actual server round-trip; it defaults to
 	// requestToServer and is swapped out in tests so the request sequence can
 	// be asserted without a live rpc client.
@@ -67,11 +70,12 @@ type NamingGrpcProxy struct {
 
 // NewNamingGrpcProxy create naming grpc proxy
 func NewNamingGrpcProxy(ctx context.Context, clientCfg constant.ClientConfig, nacosServer *nacos_server.NacosServer,
-	serviceInfoHolder *naming_cache.ServiceInfoHolder) (*NamingGrpcProxy, error) {
+	serviceInfoHolder *naming_cache.ServiceInfoHolder, fuzzyWatchHolder *naming_cache.FuzzyWatchServiceListHolder) (*NamingGrpcProxy, error) {
 	srvProxy := NamingGrpcProxy{
 		clientConfig:      clientCfg,
 		nacosServer:       nacosServer,
 		serviceInfoHolder: serviceInfoHolder,
+		fuzzyWatchHolder:  fuzzyWatchHolder,
 	}
 	srvProxy.send = srvProxy.requestToServer
 
@@ -98,6 +102,16 @@ func NewNamingGrpcProxy(ctx context.Context, clientCfg constant.ClientConfig, na
 	rpcClient.RegisterServerRequestHandler(func() rpc_request.IRequest {
 		return &rpc_request.NotifySubscriberRequest{NamingRequest: &rpc_request.NamingRequest{}}
 	}, &rpc.NamingPushRequestHandler{ServiceInfoHolder: serviceInfoHolder})
+
+	// FuzzyWatch server-push handlers. handleServerRequest only dispatches
+	// payload types that have a registered handler, so without these two the
+	// FUZZY_WATCH_SYNC / CHANGE_NOTIFY pushes would be dropped as "unsupported".
+	rpcClient.RegisterServerRequestHandler(func() rpc_request.IRequest {
+		return &rpc_request.NamingFuzzyWatchSyncRequest{Request: &rpc_request.Request{}}
+	}, &FuzzyWatchSyncRequestHandler{fuzzyWatchHolder: fuzzyWatchHolder})
+	rpcClient.RegisterServerRequestHandler(func() rpc_request.IRequest {
+		return &rpc_request.NamingFuzzyWatchChangeNotifyRequest{Request: &rpc_request.Request{}}
+	}, &FuzzyWatchChangeNotifyRequestHandler{fuzzyWatchHolder: fuzzyWatchHolder})
 
 	srvProxy.eventListener = NewConnectionEventListener(&srvProxy)
 	rpcClient.RegisterConnectionListener(srvProxy.eventListener)
@@ -324,6 +338,35 @@ func (proxy *NamingGrpcProxy) Unsubscribe(serviceName, groupName, clusters strin
 		proxy.eventListener.CacheSubscriberForRedo(util.GetGroupName(serviceName, groupName), clusters)
 	}
 	return err
+}
+
+// SendFuzzyWatchRequest sends one WATCH/CANCEL_WATCH request on behalf of the
+// reconcile worker. A non-success reply keeps its server errorCode via
+// *naming_cache.FuzzyWatchServerError so the worker can tell capacity
+// rejections from transient failures.
+func (proxy *NamingGrpcProxy) SendFuzzyWatchRequest(groupKeyPattern, watchType string, receivedGroupKeys []string, isInitializing bool) error {
+	logger.Infof("fuzzy watch namespaceId:<%s>, pattern:<%s>, watchType:<%s>, isInitializing:<%t>",
+		proxy.clientConfig.NamespaceId, groupKeyPattern, watchType, isInitializing)
+	request := rpc_request.NewNamingFuzzyWatchRequest(proxy.clientConfig.NamespaceId, groupKeyPattern,
+		watchType, receivedGroupKeys, isInitializing)
+	response, err := proxy.send(request)
+	if err != nil {
+		return err
+	}
+	if response == nil {
+		return errors.Errorf("fuzzy watch pattern:%s watchType:%s got nil response", groupKeyPattern, watchType)
+	}
+	if !response.IsSuccess() {
+		return &naming_cache.FuzzyWatchServerError{ErrorCode: response.GetErrorCode(), Message: response.GetMessage()}
+	}
+	return nil
+}
+
+// ServerSupportsFuzzyWatch reports whether the connected server advertises
+// the fuzzyWatch ability (3.x servers). Bounded wait covers the window where
+// the SetupAck push has not landed yet right after (re)connect.
+func (proxy *NamingGrpcProxy) ServerSupportsFuzzyWatch() bool {
+	return proxy.rpcClient.GetRpcClient().IsAbilitySupportedByServer(constant.ABILITY_KEY_SERVER_FUZZY_WATCH, 2*time.Second)
 }
 
 func (proxy *NamingGrpcProxy) CloseClient() {

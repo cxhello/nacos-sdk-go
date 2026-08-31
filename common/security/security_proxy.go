@@ -77,6 +77,13 @@ func BuildNamingResourceByRequest(request rpc_request.IRequest) RequestResource 
 		subscribeServiceRequest := request.(*rpc_request.SubscribeServiceRequest)
 		return BuildNamingResource(subscribeServiceRequest.Namespace, subscribeServiceRequest.GroupName, subscribeServiceRequest.ServiceName)
 	}
+	if request.GetRequestType() == constant.FUZZY_WATCH_REQUEST_NAME {
+		// Java parity (NamingGrpcClientProxy#requestToServer): fuzzy watch
+		// carries a pattern, not a concrete service, so the RAM/AK-SK
+		// resource is namespace-scoped only.
+		fuzzyWatchRequest := request.(*rpc_request.NamingFuzzyWatchRequest)
+		return BuildNamingResource(fuzzyWatchRequest.Namespace, "", "")
+	}
 	return RequestResource{
 		requestType: REQUEST_TYPE_NAMING,
 	}

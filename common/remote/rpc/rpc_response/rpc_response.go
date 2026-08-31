@@ -146,6 +146,11 @@ func registerClientResponses() {
 	registerClientResponse(func() IResponse {
 		return &ConfigRemoveResponse{Response: &Response{}}
 	})
+
+	// register NamingFuzzyWatchResponse.
+	registerClientResponse(func() IResponse {
+		return &NamingFuzzyWatchResponse{Response: &Response{}}
+	})
 }
 
 // get grpc response status code with NA default.

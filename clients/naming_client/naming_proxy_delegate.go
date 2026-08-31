@@ -38,6 +38,7 @@ type NamingProxyDelegate struct {
 	httpClientProxy   *naming_http.NamingHttpProxy
 	grpcClientProxy   *naming_grpc.NamingGrpcProxy
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	fuzzyWatchHolder  *naming_cache.FuzzyWatchServiceListHolder
 }
 
 func NewNamingProxyDelegate(ctx context.Context, clientCfg constant.ClientConfig, serverCfgs []constant.ServerConfig,
@@ -68,15 +69,21 @@ func NewNamingProxyDelegateWithRamCredentialProvider(ctx context.Context, client
 		return nil, err
 	}
 
-	grpcClientProxy, err := naming_grpc.NewNamingGrpcProxy(ctx, clientCfg, nacosServer, serviceInfoHolder)
+	fuzzyWatchHolder := naming_cache.NewFuzzyWatchServiceListHolder(clientCfg.NamespaceId)
+
+	grpcClientProxy, err := naming_grpc.NewNamingGrpcProxy(ctx, clientCfg, nacosServer, serviceInfoHolder, fuzzyWatchHolder)
 	if err != nil {
 		return nil, err
 	}
+
+	fuzzyWatchHolder.SetRequester(grpcClientProxy)
+	fuzzyWatchHolder.Start()
 
 	return &NamingProxyDelegate{
 		httpClientProxy:   httpClientProxy,
 		grpcClientProxy:   grpcClientProxy,
 		serviceInfoHolder: serviceInfoHolder,
+		fuzzyWatchHolder:  fuzzyWatchHolder,
 	}, nil
 }
 
@@ -136,5 +143,6 @@ func (proxy *NamingProxyDelegate) Unsubscribe(serviceName, groupName, clusters s
 }
 
 func (proxy *NamingProxyDelegate) CloseClient() {
+	proxy.fuzzyWatchHolder.Shutdown()
 	proxy.grpcClientProxy.CloseClient()
 }

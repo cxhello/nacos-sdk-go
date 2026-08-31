@@ -45,10 +45,18 @@ func NewConnectionEventListener(clientProxy naming_proxy.INamingProxy) *Connecti
 func (c *ConnectionEventListener) OnConnected() {
 	c.redoSubscribe()
 	c.redoRegisterEachService()
+	if grpcProxy, ok := c.clientProxy.(*NamingGrpcProxy); ok {
+		// speed up fuzzy watch convergence; the reconcile worker re-sends
+		// every inconsistent pattern
+		grpcProxy.fuzzyWatchHolder.Bell()
+	}
 }
 
 func (c *ConnectionEventListener) OnDisConnect() {
-
+	if grpcProxy, ok := c.clientProxy.(*NamingGrpcProxy); ok {
+		// every pattern must be re-synced on the next connection
+		grpcProxy.fuzzyWatchHolder.ResetConsistenceStatus()
+	}
 }
 
 func (c *ConnectionEventListener) redoSubscribe() {

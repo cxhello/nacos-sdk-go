@@ -45,6 +45,7 @@ type NamingClient struct {
 	cancel            context.CancelFunc
 	serviceProxy      naming_proxy.INamingProxy
 	serviceInfoHolder *naming_cache.ServiceInfoHolder
+	fuzzyWatchHolder  *naming_cache.FuzzyWatchServiceListHolder
 	isClosed          bool
 	mutex             sync.Mutex
 }
@@ -91,6 +92,13 @@ func NewNamingClientWithRamCredentialProvider(nc nacos_client.INacosClient, prov
 		cancel()
 		naming.serviceInfoHolder.Close()
 		return naming, err
+	}
+
+	// The delegate owns the fuzzy watch holder (it is shared with the gRPC
+	// push handlers and redo listener). Grab it so the client API can register
+	// and remove pattern callbacks against the same instance.
+	if delegate, ok := naming.serviceProxy.(*NamingProxyDelegate); ok {
+		naming.fuzzyWatchHolder = delegate.fuzzyWatchHolder
 	}
 
 	if clientConfig.AsyncUpdateService {
@@ -394,6 +402,44 @@ func (sc *NamingClient) Unsubscribe(param *vo.SubscribeParam) (err error) {
 	}
 
 	return err
+}
+
+// FuzzyWatch registers a fuzzy watch on services matching the given patterns
+// and returns a handle identifying this registration. Registration is a
+// local operation: the server-side watch is established and maintained by a
+// background reconcile worker, so the returned error only ever reflects
+// parameter validation, ErrFuzzyWatchClientClosed (the client has already
+// been shut down), or ErrFuzzyWatchNotSupported (the connected server lacks
+// the fuzzyWatch ability) - never a transient RPC outcome. Capacity
+// rejections from the server are delivered through param.OnLoadEvent.
+func (sc *NamingClient) FuzzyWatch(param *vo.FuzzyWatchParam) (*FuzzyWatchHandle, error) {
+	if param.ServiceNamePattern == "" {
+		return nil, errors.New("serviceNamePattern cannot be empty!")
+	}
+	if len(param.GroupNamePattern) == 0 {
+		param.GroupNamePattern = constant.DEFAULT_GROUP
+	}
+	if param.WatchCallback == nil {
+		return nil, errors.New("watchCallback cannot be nil!")
+	}
+	pattern := sc.buildGroupKeyPattern(param.ServiceNamePattern, param.GroupNamePattern)
+	id, err := sc.fuzzyWatchHolder.RegisterWatcher(pattern, param.WatchCallback, param.OnLoadEvent)
+	if err != nil {
+		return nil, err
+	}
+	return &FuzzyWatchHandle{holder: sc.fuzzyWatchHolder, pattern: pattern, id: id}, nil
+}
+
+// buildGroupKeyPattern joins the client's namespace with the group and service
+// patterns into the groupKeyPattern the server matches against
+// (namespace>>groupPattern>>servicePattern).
+func (sc *NamingClient) buildGroupKeyPattern(serviceNamePattern, groupNamePattern string) string {
+	namespace := constant.DEFAULT_NAMESPACE_ID
+	if cfg, err := sc.GetClientConfig(); err == nil && cfg.NamespaceId != "" {
+		namespace = cfg.NamespaceId
+	}
+	return namespace + constant.FUZZY_WATCH_PATTERN_SPLITTER + groupNamePattern +
+		constant.FUZZY_WATCH_PATTERN_SPLITTER + serviceNamePattern
 }
 
 // ServerHealthy ...

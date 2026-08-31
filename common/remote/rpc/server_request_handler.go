@@ -79,6 +79,26 @@ func (c *ClientDetectionRequestHandler) RequestReply(request rpc_request.IReques
 	return nil
 }
 
+// SetupAckRequestHandler acks the server's ability-table push. The table
+// itself is stored in GrpcClient.handleServerRequest, which sees the
+// receiving connection - this handler only owns the response.
+type SetupAckRequestHandler struct {
+}
+
+func (s *SetupAckRequestHandler) Name() string {
+	return "SetupAckRequestHandler"
+}
+
+func (s *SetupAckRequestHandler) RequestReply(request rpc_request.IRequest, _ *RpcClient) rpc_response.IResponse {
+	_, ok := request.(*rpc_request.SetupAckRequest)
+	if ok {
+		return &rpc_response.SetupAckResponse{
+			Response: &rpc_response.Response{ResultCode: constant.RESPONSE_CODE_SUCCESS},
+		}
+	}
+	return nil
+}
+
 type NamingPushRequestHandler struct {
 	ServiceInfoHolder *naming_cache.ServiceInfoHolder
 }

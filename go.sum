@@ -242,8 +242,8 @@ github.com/modern-go/reflect2 v1.0.2 h1:xBagoLtFs94CBntxluKeaWgTMpvLxC4ur3nMaC9G
 github.com/modern-go/reflect2 v1.0.2/go.mod h1:yWuevngMOJpCy52FWWMvUC8ws7m/LJsjYzDa0/r8luk=
 github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223/go.mod h1:qRWi+5nqEBWmkhHvq77mSJWrCKwh8bxhgT7d/eI7P4U=
 github.com/mwitkow/go-conntrack v0.0.0-20190716064945-2f068394615f/go.mod h1:qRWi+5nqEBWmkhHvq77mSJWrCKwh8bxhgT7d/eI7P4U=
-github.com/nacos-group/nacos-sdk-proto/go v1.0.0-beta.8 h1:x2T7SZlepnN4n/hdZuRvvgteREUbbTS0ocY+i4Wz85I=
-github.com/nacos-group/nacos-sdk-proto/go v1.0.0-beta.8/go.mod h1:Qo3wEOzamwGSmIYcAHS8i8l6QbGfu0+yJou6o9X5OVY=
+github.com/nacos-group/nacos-sdk-proto/go v1.0.0-beta.9 h1:tWfDOPxKex5r3pMU+ZBpgaoEu30Z5r3XfALuC12fnro=
+github.com/nacos-group/nacos-sdk-proto/go v1.0.0-beta.9/go.mod h1:Qo3wEOzamwGSmIYcAHS8i8l6QbGfu0+yJou6o9X5OVY=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e h1:fD57ERR4JtEqsWbfPhv4DMiApHyliiK5xCTNVSPiaAs=
 github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e/go.mod h1:zD1mROLANZcx1PVRCS0qkT7pwLkGfwJo4zjcN/Tysno=
 github.com/orcaman/concurrent-map v0.0.0-20210501183033-44dafcb38ecc h1:Ak86L+yDSOzKFa7WM5bf5itSOo1e3Xh8bm5YCMUXIjQ=

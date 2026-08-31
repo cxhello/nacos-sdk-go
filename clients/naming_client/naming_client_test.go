@@ -18,16 +18,20 @@ package naming_client
 
 import (
 	"errors"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/nacos_client"
+	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/model"
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var clientConfigTest = *constant.NewClientConfig(
@@ -39,6 +43,9 @@ var clientConfigTest = *constant.NewClientConfig(
 var serverConfigTest = *constant.NewServerConfig("127.0.0.1", 80, constant.WithContextPath("/nacos"))
 
 type MockNamingProxy struct {
+	// mu guards every field below.
+	mu sync.Mutex
+
 	unsubscribeCalled bool
 	unsubscribeParams []string // 记录调用参数
 	unsubscribeErr    error    // 注入 Unsubscribe 失败
@@ -73,12 +80,26 @@ func (m *MockNamingProxy) Subscribe(serviceName, groupName, clusters string) (mo
 }
 
 func (m *MockNamingProxy) Unsubscribe(serviceName, groupName, clusters string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.unsubscribeCalled = true
 	m.unsubscribeParams = []string{serviceName, groupName, clusters}
 	return m.unsubscribeErr
 }
 
 func (m *MockNamingProxy) CloseClient() {}
+
+// stubFuzzyWatchRequester is a minimal naming_cache.FuzzyWatchRequester for
+// NewTestNamingClient: it always reports fuzzy watch as supported and never
+// actually sends anything, which is fine since these tests never start the
+// reconcile worker - FuzzyWatch registration only touches local state.
+type stubFuzzyWatchRequester struct{ supported bool }
+
+func (s stubFuzzyWatchRequester) SendFuzzyWatchRequest(string, string, []string, bool) error {
+	return nil
+}
+
+func (s stubFuzzyWatchRequester) ServerSupportsFuzzyWatch() bool { return s.supported }
 
 func NewTestNamingClient() *NamingClient {
 	nc := nacos_client.NacosClient{}
@@ -87,6 +108,8 @@ func NewTestNamingClient() *NamingClient {
 	_ = nc.SetHttpAgent(&http_agent.HttpAgent{})
 	client, _ := NewNamingClient(&nc)
 	client.serviceProxy = &MockNamingProxy{}
+	client.fuzzyWatchHolder = naming_cache.NewFuzzyWatchServiceListHolder(constant.DEFAULT_NAMESPACE_ID)
+	client.fuzzyWatchHolder.SetRequester(stubFuzzyWatchRequester{supported: true})
 	return client
 }
 func Test_RegisterServiceInstance_withoutGroupName(t *testing.T) {
@@ -694,4 +717,83 @@ func TestNamingClient_Unsubscribe_RestoresCallbackOnProxyFailure(t *testing.T) {
 	assert.True(t, mockProxy.unsubscribeCalled)
 	assert.True(t, client.serviceInfoHolder.IsSubscribed(util.GetGroupName("svc-restore", "g"), ""),
 		"callback must be restored when the server-side unsubscribe fails")
+}
+
+func TestFuzzyWatch_EmptyServiceNamePattern(t *testing.T) {
+	handle, err := NewTestNamingClient().FuzzyWatch(&vo.FuzzyWatchParam{
+		WatchCallback: func(model.FuzzyWatchChangeEvent) {},
+	})
+	assert.Error(t, err)
+	assert.Nil(t, handle)
+}
+
+func TestFuzzyWatch_NilCallback(t *testing.T) {
+	handle, err := NewTestNamingClient().FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+	})
+	assert.Error(t, err)
+	assert.Nil(t, handle)
+}
+
+// TestFuzzyWatch_Success asserts that a valid registration returns a handle
+// identifying the resolved groupKeyPattern; the underlying WATCH RPC itself
+// is owned by the reconcile worker (see naming_cache) and is not part of
+// this call's error path.
+func TestFuzzyWatch_Success(t *testing.T) {
+	client := NewTestNamingClient()
+	pattern := client.buildGroupKeyPattern("order*", constant.DEFAULT_GROUP)
+
+	handle, err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, handle)
+	assert.Equal(t, pattern, handle.Pattern())
+	assert.Contains(t, client.fuzzyWatchHolder.Patterns(), pattern)
+}
+
+// TestFuzzyWatch_NotSupported is a regression test: a server (or connection
+// state) that does not advertise the fuzzyWatch ability must fail the
+// registration fast rather than silently register a watch that will never
+// receive a server push.
+func TestFuzzyWatch_NotSupported(t *testing.T) {
+	client := NewTestNamingClient()
+	client.fuzzyWatchHolder = naming_cache.NewFuzzyWatchServiceListHolder(constant.DEFAULT_NAMESPACE_ID)
+	client.fuzzyWatchHolder.SetRequester(stubFuzzyWatchRequester{supported: false})
+
+	handle, err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback:      func(model.FuzzyWatchChangeEvent) {},
+	})
+
+	assert.Error(t, err)
+	assert.Nil(t, handle)
+}
+
+// TestFuzzyWatchHandle_CancelStopsDelivery asserts that Cancel removes this
+// handle's registration: a change notify fired after Cancel must not reach
+// the canceled callback. Idempotency and per-handle scoping are covered
+// directly in naming_client's fuzzy_watch_handle_test.go and naming_cache's
+// worker tests.
+func TestFuzzyWatchHandle_CancelStopsDelivery(t *testing.T) {
+	client := NewTestNamingClient()
+	got := make(chan model.FuzzyWatchChangeEvent, 4)
+
+	handle, err := client.FuzzyWatch(&vo.FuzzyWatchParam{
+		ServiceNamePattern: "order*",
+		WatchCallback:      func(ev model.FuzzyWatchChangeEvent) { got <- ev },
+	})
+	require.NoError(t, err)
+
+	handle.Cancel()
+	handle.Cancel() // idempotent, must not panic
+
+	client.fuzzyWatchHolder.HandleChangeNotify("public@@DEFAULT_GROUP@@order-a", constant.FUZZY_WATCH_CHANGED_TYPE_ADD_SERVICE)
+	select {
+	case ev := <-got:
+		t.Fatalf("canceled watcher must not receive events, got %+v", ev)
+	case <-time.After(200 * time.Millisecond):
+	}
 }

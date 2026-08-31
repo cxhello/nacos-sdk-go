@@ -17,6 +17,8 @@
 package rpc
 
 import (
+	"sync"
+
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
 	"google.golang.org/grpc"
@@ -29,6 +31,8 @@ type IConnection interface {
 	getServerInfo() ServerInfo
 	setAbandon(flag bool)
 	getAbandon() bool
+	setAbilityTable(table map[string]bool)
+	getAbilityTable() (map[string]bool, bool)
 }
 
 type Connection struct {
@@ -36,6 +40,9 @@ type Connection struct {
 	connectionId string
 	abandon      bool
 	serverInfo   ServerInfo
+
+	abilityMu    sync.RWMutex
+	abilityTable map[string]bool
 }
 
 func (c *Connection) getConnectionId() string {
@@ -56,4 +63,20 @@ func (c *Connection) getAbandon() bool {
 
 func (c *Connection) close() {
 	_ = c.conn.Close()
+}
+
+// setAbilityTable stores the server-advertised ability table. Called from the
+// bi-stream push handler when SetupAckRequest arrives.
+func (c *Connection) setAbilityTable(table map[string]bool) {
+	c.abilityMu.Lock()
+	defer c.abilityMu.Unlock()
+	c.abilityTable = table
+}
+
+// getAbilityTable returns the negotiated table and whether it has arrived yet.
+// Absent (false) is distinct from empty: pre-2.2 servers never send SetupAck.
+func (c *Connection) getAbilityTable() (map[string]bool, bool) {
+	c.abilityMu.RLock()
+	defer c.abilityMu.RUnlock()
+	return c.abilityTable, c.abilityTable != nil
 }

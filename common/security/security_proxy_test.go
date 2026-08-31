@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
+	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -81,4 +82,13 @@ func TestSecurityProxy_AutoRefresh_DelegatesToClients(t *testing.T) {
 	default:
 		t.Fatal("AutoRefresh should delegate to each client's AutoRefresh")
 	}
+}
+
+func TestBuildNamingResourceForFuzzyWatchRequest(t *testing.T) {
+	req := rpc_request.NewNamingFuzzyWatchRequest("ns-1", "ns-1>>DEFAULT_GROUP>>svc*",
+		constant.FUZZY_WATCH_TYPE_WATCH, nil, true)
+	resource := BuildNamingResourceByRequest(req)
+	assert.Equal(t, "ns-1", resource.namespace)
+	assert.Equal(t, "", resource.group)
+	assert.Equal(t, "", resource.resource)
 }

@@ -46,7 +46,7 @@ func decodeProtoResponse(payload *nacos_grpc_service.Payload) (rpc_response.IRes
 	switch payload.GetMetadata().GetType() {
 	case "HealthCheckResponse", "ServerCheckResponse", "ErrorResponse",
 		"InstanceResponse", "BatchInstanceResponse", "QueryServiceResponse",
-		"SubscribeServiceResponse", "ServiceListResponse":
+		"SubscribeServiceResponse", "ServiceListResponse", "NamingFuzzyWatchResponse":
 	default:
 		return nil, false, nil
 	}
@@ -89,6 +89,10 @@ func decodeProtoResponse(payload *nacos_grpc_service.Payload) (rpc_response.IRes
 			Count:        int(m.Count),
 			ServiceNames: m.ServiceNames,
 		}, true, nil
+	case *naming.NamingFuzzyWatchResponse:
+		return &rpc_response.NamingFuzzyWatchResponse{
+			Response: adaptBaseResponse(m.ResultCode, m.ErrorCode, m.Message, m.RequestId, body),
+		}, true, nil
 	}
 	return nil, true, errors.Errorf("no proto adapter for migrated type %s", payload.GetMetadata().GetType())
 }
@@ -124,7 +128,8 @@ func adaptBaseResponse(resultCode, errorCode int32, message, requestId string, b
 // wins over fail-fast here.
 func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.IRequest, bool) {
 	switch payload.GetMetadata().GetType() {
-	case "ConnectResetRequest", "ClientDetectionRequest", "NotifySubscriberRequest":
+	case "ConnectResetRequest", "ClientDetectionRequest", "NotifySubscriberRequest",
+		"NamingFuzzyWatchSyncRequest", "NamingFuzzyWatchChangeNotifyRequest", "SetupAckRequest":
 	default:
 		return nil, false
 	}
@@ -151,6 +156,38 @@ func decodeProtoServerRequest(payload *nacos_grpc_service.Payload) (rpc_request.
 		req := &rpc_request.NotifySubscriberRequest{
 			NamingRequest: rpc_request.NewNamingRequest(m.Namespace, m.ServiceName, m.GroupName),
 			ServiceInfo:   fromProtoServiceInfo(m.ServiceInfo),
+		}
+		req.RequestId = m.RequestId
+		return req, true
+	case *naming.NamingFuzzyWatchSyncRequest:
+		contexts := make([]rpc_request.NamingFuzzyWatchSyncContext, 0, len(m.Contexts))
+		for _, c := range m.Contexts {
+			contexts = append(contexts, rpc_request.NamingFuzzyWatchSyncContext{
+				ServiceKey:  c.GetServiceKey(),
+				ChangedType: c.GetChangedType(),
+			})
+		}
+		req := &rpc_request.NamingFuzzyWatchSyncRequest{
+			Request:         &rpc_request.Request{RequestId: m.RequestId},
+			SyncType:        m.SyncType,
+			GroupKeyPattern: m.GroupKeyPattern,
+			Contexts:        contexts,
+			TotalBatch:      int(m.TotalBatch),
+			CurrentBatch:    int(m.CurrentBatch),
+		}
+		return req, true
+	case *naming.NamingFuzzyWatchChangeNotifyRequest:
+		req := &rpc_request.NamingFuzzyWatchChangeNotifyRequest{
+			Request:     &rpc_request.Request{RequestId: m.RequestId},
+			SyncType:    m.SyncType,
+			ServiceKey:  m.ServiceKey,
+			ChangedType: m.ChangedType,
+		}
+		return req, true
+	case *common.SetupAckRequest:
+		req := &rpc_request.SetupAckRequest{
+			InternalRequest: rpc_request.NewInternalRequest(),
+			AbilityTable:    m.AbilityTable,
 		}
 		req.RequestId = m.RequestId
 		return req, true

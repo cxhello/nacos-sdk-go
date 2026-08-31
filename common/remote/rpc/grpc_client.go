@@ -389,6 +389,13 @@ func (c *GrpcClient) handleServerRequest(p *nacos_grpc_service.Payload, grpcConn
 
 	serverRequest.PutAllHeaders(p.GetMetadata().Headers)
 
+	// SetupAck can arrive while connectToServer is still in its post-setup
+	// sleep, before the caller has stored this connection as current - so the
+	// table must be attached to the receiving connection, not the current one.
+	if ack, ok := serverRequest.(*rpc_request.SetupAckRequest); ok {
+		grpcConn.setAbilityTable(ack.AbilityTable)
+	}
+
 	response := mapping.handler.RequestReply(serverRequest, client)
 	if response == nil {
 		logger.Warnf("%s Fail to process server request, ackId->%s", grpcConn.getConnectionId(),

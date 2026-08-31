@@ -25,7 +25,9 @@ import (
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_cache"
 	"github.com/nacos-group/nacos-sdk-go/v3/clients/naming_client/naming_proxy"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/constant"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
@@ -427,4 +429,59 @@ func TestDeregisterInstanceRejectsOutOfRangePort(t *testing.T) {
 	retained, isBatch := proxy.eventListener.GetBatchInstancesForRedo("svc", "group")
 	assert.True(t, isBatch)
 	assert.Equal(t, []model.Instance{a, b}, retained)
+}
+
+func TestSendFuzzyWatchRequestSendsWatch(t *testing.T) {
+	proxy, sent := newTestProxy()
+	err := proxy.SendFuzzyWatchRequest("public>>DEFAULT_GROUP>>order*", constant.FUZZY_WATCH_TYPE_WATCH, nil, true)
+	require.NoError(t, err)
+
+	require.Len(t, *sent, 1)
+	req, ok := (*sent)[0].(*rpc_request.NamingFuzzyWatchRequest)
+	require.True(t, ok, "SendFuzzyWatchRequest sends a NamingFuzzyWatchRequest")
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_WATCH, req.WatchType)
+	assert.True(t, req.IsInitializing, "first watch is initializing")
+	assert.Equal(t, "public>>DEFAULT_GROUP>>order*", req.GroupKeyPattern)
+}
+
+func TestSendFuzzyWatchRequestSendsCancel(t *testing.T) {
+	proxy, sent := newTestProxy()
+	err := proxy.SendFuzzyWatchRequest("public>>DEFAULT_GROUP>>order*", constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, nil, false)
+	require.NoError(t, err)
+	require.Len(t, *sent, 1)
+	req := (*sent)[0].(*rpc_request.NamingFuzzyWatchRequest)
+	assert.Equal(t, constant.FUZZY_WATCH_TYPE_CANCEL_WATCH, req.WatchType)
+}
+
+// TestSendFuzzyWatchRequestSurfacesServerError is a regression test: a
+// non-success reply must come back as *naming_cache.FuzzyWatchServerError
+// with the server's errorCode preserved, so the reconcile worker can tell a
+// capacity rejection from a transient failure.
+func TestSendFuzzyWatchRequestSurfacesServerError(t *testing.T) {
+	proxy, _ := newTestProxy()
+	proxy.send = func(r rpc_request.IRequest) (rpc_response.IResponse, error) {
+		return &rpc_response.InstanceResponse{Response: &rpc_response.Response{
+			ResultCode: 500, ErrorCode: constant.ERROR_CODE_FUZZY_WATCH_PATTERN_OVER_LIMIT, Message: "boom",
+		}}, nil
+	}
+
+	err := proxy.SendFuzzyWatchRequest("public>>DEFAULT_GROUP>>order*", constant.FUZZY_WATCH_TYPE_WATCH, nil, true)
+
+	require.Error(t, err)
+	var serverErr *naming_cache.FuzzyWatchServerError
+	require.ErrorAs(t, err, &serverErr)
+	assert.Equal(t, constant.ERROR_CODE_FUZZY_WATCH_PATTERN_OVER_LIMIT, serverErr.ErrorCode)
+}
+
+// TestSendFuzzyWatchRequestNilResponse is a regression test: send() can
+// legally return a nil response alongside a nil error, which must not be
+// mistaken for success.
+func TestSendFuzzyWatchRequestNilResponse(t *testing.T) {
+	proxy, _ := newTestProxy()
+	proxy.send = func(r rpc_request.IRequest) (rpc_response.IResponse, error) {
+		return nil, nil
+	}
+
+	err := proxy.SendFuzzyWatchRequest("public>>DEFAULT_GROUP>>order*", constant.FUZZY_WATCH_TYPE_WATCH, nil, true)
+	assert.Error(t, err)
 }
