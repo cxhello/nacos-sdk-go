@@ -864,3 +864,38 @@ func TestExecuteConfigListen_ReviveDuringCancelSendPreventsRemoval(t *testing.T)
 	defer cd.mu.Unlock()
 	assert.False(t, cd.discard, "revived entry must not be discarded")
 }
+
+// TestListenConfigOnClosedClientReturnsError verifies ListenConfig rejects
+// registration once the client has been closed (#904 semantics: isClosed
+// must be checked under client.mutex at the ListenConfig entry point rather
+// than silently registering a listener that will never be served again).
+func TestListenConfigOnClosedClientReturnsError(t *testing.T) {
+	client := createConfigClientTest()
+	client.CloseClient()
+
+	err := client.ListenConfig(vo.ConfigParam{DataId: "d", Group: "g", OnChange: noopOnChange})
+	require.Error(t, err, "ListenConfig on a closed client must return an error")
+}
+
+// TestCancelListenConfigOnClosedClientDoesNotPanic verifies CancelListenConfig
+// remains safe to call after the client has been closed.
+func TestCancelListenConfigOnClosedClientDoesNotPanic(t *testing.T) {
+	client := createConfigClientTest()
+	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: noopOnChange}
+	require.NoError(t, client.ListenConfig(p))
+	client.CloseClient()
+
+	assert.NotPanics(t, func() {
+		err := client.CancelListenConfig(p)
+		assert.NoError(t, err)
+	})
+}
+
+// TestCloseClientTwiceDoesNotPanic verifies CloseClient is idempotent.
+func TestCloseClientTwiceDoesNotPanic(t *testing.T) {
+	client := createConfigClientTest()
+	assert.NotPanics(t, func() {
+		client.CloseClient()
+		client.CloseClient()
+	})
+}

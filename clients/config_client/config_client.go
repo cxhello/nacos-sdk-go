@@ -292,6 +292,12 @@ func (client *ConfigClient) ListenConfig(param vo.ConfigParam) (err error) {
 		err = errors.New("[client.ListenConfig] Group can not be empty")
 		return err
 	}
+	client.mutex.Lock()
+	closed := client.isClosed
+	client.mutex.Unlock()
+	if closed {
+		return errors.New("[client.ListenConfig] client is closed")
+	}
 	clientConfig, err := client.GetClientConfig()
 	if err != nil {
 		err = errors.New("[checkConfigInfo.GetClientConfig] failed")
