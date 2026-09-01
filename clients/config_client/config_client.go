@@ -48,6 +48,12 @@ const (
 	executorErrDelay  = 5 * time.Second
 )
 
+// ErrConfigClientClosed is returned by ListenConfig once CloseClient has run:
+// the listen executor goroutine is gone for good, so a newly (or
+// concurrently) committed listener could never be served. Exported so
+// callers can errors.Is against it rather than matching on error text.
+var ErrConfigClientClosed = errors.New("config client is closed")
+
 type ConfigClient struct {
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -296,7 +302,7 @@ func (client *ConfigClient) ListenConfig(param vo.ConfigParam) (err error) {
 	closed := client.isClosed
 	client.mutex.Unlock()
 	if closed {
-		return errors.New("[client.ListenConfig] client is closed")
+		return ErrConfigClientClosed
 	}
 	clientConfig, err := client.GetClientConfig()
 	if err != nil {
@@ -337,6 +343,28 @@ func (client *ConfigClient) ListenConfig(param vo.ConfigParam) (err error) {
 	// around isInitializing/md5 followed by a separately-locked addListener
 	// call is unsafe against a concurrent CancelListenConfig.
 	cData.reviveAndAddListener(param.OnChange)
+
+	// CloseClient may land concurrently, between the isClosed check above and
+	// the commit just performed -- neither the check nor the seed's disk I/O
+	// nor the commit itself holds client.mutex.
+	return client.rejectIfClosedAfterCommit(cData)
+}
+
+// rejectIfClosedAfterCommit re-checks isClosed under client.mutex -- the same
+// lock CloseClient sets isClosed under, and isClosed only ever transitions
+// false->true -- immediately after a ListenConfig commit (getOrCreate +
+// reviveAndAddListener). This linearizes the commit against CloseClient: if a
+// close has already landed by this point, the commit is rolled back via
+// cData.markDiscard() rather than left live on a client whose listen executor
+// is gone for good.
+func (client *ConfigClient) rejectIfClosedAfterCommit(cData *cacheData) error {
+	client.mutex.Lock()
+	closed := client.isClosed
+	client.mutex.Unlock()
+	if closed {
+		cData.markDiscard()
+		return ErrConfigClientClosed
+	}
 	return nil
 }
 
@@ -578,9 +606,25 @@ func (client *ConfigClient) buildListenTask(needAllSync bool) (listenBatch, canc
 	return listenBatch, cancelBatch
 }
 
+// asyncNotifyListenConfig wakes the listen executor without blocking the
+// caller. The send races against client.ctx.Done() rather than committing to
+// an unconditional send: startInternal's executor loop returns as soon as
+// ctx is cancelled (CloseClient), and after that nothing ever receives from
+// listenExecute again, so an unconditional send would leak this goroutine
+// forever once the client is closed. client.ctx is nil only for ConfigClient
+// values built by hand (bypassing the constructor, as some tests do) rather
+// than through NewConfigClientWithRamCredentialProvider; guard against that
+// so this stays a plain, always-eventually-unblocked send in that case.
 func (client *ConfigClient) asyncNotifyListenConfig() {
 	go func() {
-		client.listenExecute <- struct{}{}
+		if client.ctx == nil {
+			client.listenExecute <- struct{}{}
+			return
+		}
+		select {
+		case client.listenExecute <- struct{}{}:
+		case <-client.ctx.Done():
+		}
 	}()
 }
 

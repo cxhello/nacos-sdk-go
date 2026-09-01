@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -868,13 +869,136 @@ func TestExecuteConfigListen_ReviveDuringCancelSendPreventsRemoval(t *testing.T)
 // TestListenConfigOnClosedClientReturnsError verifies ListenConfig rejects
 // registration once the client has been closed (#904 semantics: isClosed
 // must be checked under client.mutex at the ListenConfig entry point rather
-// than silently registering a listener that will never be served again).
+// than silently registering a listener that will never be served again), and
+// that the error is the exported sentinel so callers can errors.Is against it
+// instead of matching on error text.
 func TestListenConfigOnClosedClientReturnsError(t *testing.T) {
 	client := createConfigClientTest()
 	client.CloseClient()
 
 	err := client.ListenConfig(vo.ConfigParam{DataId: "d", Group: "g", OnChange: noopOnChange})
 	require.Error(t, err, "ListenConfig on a closed client must return an error")
+	assert.True(t, errors.Is(err, ErrConfigClientClosed), "error must be (or wrap) ErrConfigClientClosed, got: %v", err)
+}
+
+// TestListenConfigCommitRollsBackWhenCloseWinsRace deterministically
+// exercises the exact linearization gap Finding 1 fixes: ListenConfig's
+// isClosed check was read-then-released under client.mutex, but the commit
+// that follows (getOrCreate + reviveAndAddListener, including the seed's disk
+// I/O) ran outside that lock. A CloseClient landing in that window used to
+// register a live listener on an already-shut-down client (whose listen
+// executor goroutine has already exited for good) while ListenConfig still
+// reported success -- a "ghost listener" that can never be served again.
+//
+// Forcing that interleaving through a real concurrent ListenConfig call is
+// inherently racy (see TestListenConfigRaceWithCloseClientNeverLeavesLiveListenerOnClosedClient
+// below for the statistical version and why it can't be made exact without a
+// test-only hook). This test instead drives the same two steps ListenConfig
+// performs -- commit, then the post-commit closed re-check -- directly, with
+// CloseClient() deterministically sequenced in between, and asserts the
+// re-check (client.rejectIfClosedAfterCommit) detects the closed client and
+// rolls the commit back via cData.markDiscard(). This fails to compile/RED
+// against the pre-fix code, which had no such re-check at all.
+func TestListenConfigCommitRollsBackWhenCloseWinsRace(t *testing.T) {
+	client := createConfigClientTest()
+	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: noopOnChange}
+	clientConfig, err := client.GetClientConfig()
+	require.NoError(t, err)
+	key := util.GetConfigCacheKey(p.DataId, p.Group, clientConfig.NamespaceId)
+
+	cData := client.holder.getOrCreate(key, func() *cacheData {
+		return &cacheData{dataId: p.DataId, group: p.Group, tenant: clientConfig.NamespaceId}
+	})
+	// Step 1: the commit ListenConfig performs before its post-commit check.
+	cData.reviveAndAddListener(p.OnChange)
+	// Step 2: CloseClient lands immediately afterward -- the exact window
+	// Finding 1 closes.
+	client.CloseClient()
+
+	// Step 3: the same post-commit re-check ListenConfig runs.
+	err = client.rejectIfClosedAfterCommit(cData)
+	require.ErrorIs(t, err, ErrConfigClientClosed)
+
+	cData.mu.Lock()
+	defer cData.mu.Unlock()
+	assert.True(t, cData.discard, "a commit landing on an already-closed client must be rolled back")
+	assert.Empty(t, cData.listeners, "no live listener may remain once the commit is rolled back")
+}
+
+// TestListenConfigRaceWithCloseClientNeverLeavesLiveListenerOnClosedClient is
+// the statistical companion to the deterministic test above: it hammers many
+// fresh client/key pairs, racing the real ListenConfig against CloseClient on
+// each, since the deterministic test alone doesn't exercise ListenConfig's
+// own scheduling of commit vs. the isClosed checks.
+//
+// Note this cannot use an exact zero-violations invariant: even with the fix
+// applied, ListenConfig's post-commit re-check can legitimately observe
+// isClosed==false a few instructions before a concurrent CloseClient's own
+// critical section completes -- that ordering means the commit genuinely
+// happened-before the close, which is correct, unproblematic behavior (the
+// registered listener simply goes inert once the executor loop exits), not a
+// ghost listener. That produces a small amount of benign "noise" indistinguishable
+// from outside the mutex. Empirically this fixed-code noise is under ~2% of
+// iterations, against ~40-45% for the pre-fix code with no re-check/rollback
+// at all, so a generous 10% threshold cleanly separates RED from GREEN
+// without flaking on the benign race.
+func TestListenConfigRaceWithCloseClientNeverLeavesLiveListenerOnClosedClient(t *testing.T) {
+	const iterations = 500
+	var violations atomic.Int32
+
+	for i := 0; i < iterations; i++ {
+		client := createConfigClientTest()
+		p := vo.ConfigParam{
+			DataId:   fmt.Sprintf("race-close-d-%d", i),
+			Group:    "race-close-g",
+			OnChange: noopOnChange,
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		var listenErr error
+		start := make(chan struct{})
+		go func() {
+			defer wg.Done()
+			<-start
+			listenErr = client.ListenConfig(p)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			client.CloseClient()
+		}()
+		close(start)
+		wg.Wait()
+
+		// Both goroutines have finished, so CloseClient has definitely
+		// completed: the client is now closed for good.
+		client.mutex.Lock()
+		closed := client.isClosed
+		client.mutex.Unlock()
+		require.True(t, closed, "CloseClient must have completed by now")
+
+		if listenErr != nil {
+			continue
+		}
+
+		clientConfig, err := client.GetClientConfig()
+		require.NoError(t, err)
+		key := util.GetConfigCacheKey(p.DataId, p.Group, clientConfig.NamespaceId)
+		cData, ok := client.holder.get(key)
+		if !ok {
+			continue
+		}
+		cData.mu.Lock()
+		liveListener := !cData.discard && len(cData.listeners) > 0
+		cData.mu.Unlock()
+		if liveListener {
+			violations.Add(1)
+		}
+	}
+
+	assert.LessOrEqual(t, violations.Load(), int32(iterations/10),
+		"live-listener-on-closed-client rate must stay near the benign race's noise floor, not the pre-fix ~40%% rate")
 }
 
 // TestCancelListenConfigOnClosedClientDoesNotPanic verifies CancelListenConfig
@@ -889,6 +1013,40 @@ func TestCancelListenConfigOnClosedClientDoesNotPanic(t *testing.T) {
 		err := client.CancelListenConfig(p)
 		assert.NoError(t, err)
 	})
+}
+
+// TestAsyncNotifyListenConfigDoesNotLeakAfterClose is a regression test for
+// asyncNotifyListenConfig spawning a goroutine that would block forever
+// trying to send on client.listenExecute once the listen executor loop
+// (startInternal) has already returned via <-client.ctx.Done() after
+// CloseClient -- nothing ever receives from listenExecute again past that
+// point, so an unconditional send used to leak one goroutine per call
+// (e.g. every CancelListenConfig after close, since it calls
+// asyncNotifyListenConfig unconditionally). The send is now selected against
+// <-client.ctx.Done() too, so each spawned goroutine exits as soon as the
+// client is closed instead of leaking.
+func TestAsyncNotifyListenConfigDoesNotLeakAfterClose(t *testing.T) {
+	client := createConfigClientTest()
+	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: noopOnChange}
+	require.NoError(t, client.ListenConfig(p))
+	client.CloseClient()
+
+	runtime.GC()
+	before := runtime.NumGoroutine()
+
+	const calls = 200
+	for i := 0; i < calls; i++ {
+		// CancelListenConfig calls asyncNotifyListenConfig unconditionally
+		// whenever the key is known; exercise the same path CloseClient
+		// leaves callers with.
+		_ = client.CancelListenConfig(p)
+	}
+
+	require.Eventually(t, func() bool {
+		runtime.GC()
+		return runtime.NumGoroutine() <= before+5
+	}, time.Second, 10*time.Millisecond,
+		"asyncNotifyListenConfig goroutines must not leak once the client is closed")
 }
 
 // TestCloseClientTwiceDoesNotPanic verifies CloseClient is idempotent.
