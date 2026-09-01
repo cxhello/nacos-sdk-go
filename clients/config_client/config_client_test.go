@@ -792,11 +792,9 @@ func TestExecuteConfigListen_CancelAndListenBatchesDoNotCrossContaminate(t *test
 }
 
 // TestExecuteConfigListen_ChangedKeyNotifiesAllListeners verifies that a key
-// reported in ChangedConfigs is refreshed via refreshContentAndCheck and that
-// every listener registered on that key is notified. Per controller ruling
-// R1, this is asserted against the current interim delivery path's
-// observable behavior (both listeners receive the change), not against
-// Task 5's future per-listener watermark implementation.
+// reported in ChangedConfigs is refreshed via refreshContentAndCheck, which
+// in turn drives cacheData.notifyListeners, and that every listener
+// registered on that key is notified of the change in a single round.
 func TestExecuteConfigListen_ChangedKeyNotifiesAllListeners(t *testing.T) {
 	got := make(chan string, 2)
 	p := &scriptedProxy{}

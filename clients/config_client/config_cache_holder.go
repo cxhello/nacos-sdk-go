@@ -19,6 +19,8 @@ package config_client
 import (
 	"sync"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/common/filter"
+	"github.com/nacos-group/nacos-sdk-go/v3/common/logger"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
 )
 
@@ -149,6 +151,94 @@ func (c *cacheData) reviveAndAddListener(l vo.Listener) {
 	c.discard = false
 	c.isInitializing = true
 	c.listeners = append(c.listeners, &listenerWrap{listener: l, lastCallMd5: c.md5})
+}
+
+// notifyListeners delivers the entry's current content to every listener
+// whose watermark (lastCallMd5) differs from the entry's md5. The snapshot
+// (md5, content, encryptedDataKey, dataId/group/tenant, and the set of
+// not-yet-caught-up wraps) is taken under c.mu, which is released before any
+// callback runs -- callbacks must never run while holding the lock, since a
+// slow or panicking listener would otherwise block every other operation on
+// this entry (addListener, markDiscard, a concurrent notifyListeners round).
+//
+// The content handed to listeners is the filter chain's output, not the raw
+// cacheData content: this preserves the pre-existing decryption path for
+// cipher- dataIds (the same DoFilters(&vo.ConfigParam{..., UsageType:
+// ResponseType}) semantics the old executeListener used). If the filter
+// chain errors, the entire round is skipped without advancing any
+// watermark, so the next round retries.
+//
+// Each wrap's watermark is advanced to the snapshotted md5 (not a fresh
+// re-read -- content may change concurrently with these callbacks) only if
+// its callback returns normally: a panicking listener leaves its own
+// watermark untouched so the same content is redelivered to it next round,
+// while every other listener on the same key still receives this round's
+// notification. Callbacks run synchronously on the calling goroutine (the
+// listen executor goroutine is already asynchronous with respect to user
+// code, and running callbacks concurrently with each other would let a slow
+// listener fan out into unbounded goroutines).
+func (c *cacheData) notifyListeners(chain filter.IConfigFilterChain) {
+	c.mu.Lock()
+	dataId, group, tenant := c.dataId, c.group, c.tenant
+	content := c.content
+	encryptedDataKey := c.encryptedDataKey
+	md5 := c.md5
+	toNotify := make([]*listenerWrap, 0, len(c.listeners))
+	for _, lw := range c.listeners {
+		if lw.lastCallMd5 != md5 {
+			toNotify = append(toNotify, lw)
+		}
+	}
+	c.mu.Unlock()
+
+	if len(toNotify) == 0 {
+		return
+	}
+
+	param := &vo.ConfigParam{
+		DataId:           dataId,
+		Content:          content,
+		EncryptedDataKey: encryptedDataKey,
+		UsageType:        vo.ResponseType,
+	}
+	if err := chain.DoFilters(param); err != nil {
+		logger.Errorf("do filters failed ,dataId=%s,group=%s,tenant=%s,err:%+v ", dataId, group, tenant, err)
+		return
+	}
+	decryptedContent := param.Content
+
+	for _, lw := range toNotify {
+		c.deliverAndAdvance(lw, tenant, group, dataId, decryptedContent, md5)
+	}
+}
+
+// deliverAndAdvance invokes lw's listener and, only if it returns normally,
+// advances lw.lastCallMd5 to md5 under c.mu. The watermark write is
+// re-locked separately from notifyListeners' own snapshot lock so it never
+// happens while a callback is in flight.
+func (c *cacheData) deliverAndAdvance(lw *listenerWrap, tenant, group, dataId, content, md5 string) {
+	if !callListenerSafely(lw.listener, tenant, group, dataId, content) {
+		return
+	}
+	c.mu.Lock()
+	lw.lastCallMd5 = md5
+	c.mu.Unlock()
+}
+
+// callListenerSafely invokes listener, recovering from any panic so a single
+// misbehaving listener cannot take down the executor goroutine or prevent
+// other listeners on the same key from being notified this round. It
+// reports whether the callback returned normally.
+func callListenerSafely(listener vo.Listener, tenant, group, dataId, content string) (succeeded bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.Errorf("listener panic recovered, dataId=%s, group=%s, tenant=%s, panic=%v", dataId, group, tenant, r)
+			succeeded = false
+		}
+	}()
+	listener(tenant, group, dataId, content)
+	succeeded = true
+	return
 }
 
 // markDiscard flags the entry as cancelled: it stops being treated as synced

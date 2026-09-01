@@ -63,48 +63,6 @@ type ConfigClient struct {
 	isClosed                 bool
 }
 
-// notifyListenersIfChanged notifies every listener registered on cData whose
-// own md5 watermark differs from cData's current md5, and advances that
-// listener's watermark to the current md5. This is an interim, whole-entry
-// notify path kept behaviorally equivalent to the previous single-listener
-// executeListener(): Task 5 will replace it with real per-listener delivery
-// semantics.
-func (client *ConfigClient) notifyListenersIfChanged(cData *cacheData) {
-	cData.mu.Lock()
-	dataId, group, tenant := cData.dataId, cData.group, cData.tenant
-	content := cData.content
-	encryptedDataKey := cData.encryptedDataKey
-	md5 := cData.md5
-	toNotify := make([]*listenerWrap, 0, len(cData.listeners))
-	for _, lw := range cData.listeners {
-		if lw.lastCallMd5 != md5 {
-			lw.lastCallMd5 = md5
-			toNotify = append(toNotify, lw)
-		}
-	}
-	cData.mu.Unlock()
-
-	if len(toNotify) == 0 {
-		return
-	}
-
-	param := &vo.ConfigParam{
-		DataId:           dataId,
-		Content:          content,
-		EncryptedDataKey: encryptedDataKey,
-		UsageType:        vo.ResponseType,
-	}
-	if err := client.configFilterChainManager.DoFilters(param); err != nil {
-		logger.Errorf("do filters failed ,dataId=%s,group=%s,tenant=%s,err:%+v ", dataId, group, tenant, err)
-		return
-	}
-	decryptedContent := param.Content
-	for _, lw := range toNotify {
-		listener := lw.listener
-		go listener(tenant, group, dataId, decryptedContent)
-	}
-}
-
 func NewConfigClientWithRamCredentialProvider(nc nacos_client.INacosClient, provider security.RamCredentialProvider) (*ConfigClient, error) {
 	config := &ConfigClient{}
 	config.ctx, config.cancel = context.WithCancel(context.Background())
@@ -583,7 +541,7 @@ func (client *ConfigClient) refreshContentAndCheck(cData *cacheData, notify bool
 	cData.md5 = util.Md5(cData.content)
 	cData.mu.Unlock()
 
-	client.notifyListenersIfChanged(cData)
+	cData.notifyListeners(client.configFilterChainManager)
 }
 
 // buildListenTask partitions the current holder snapshot into two batches,
