@@ -53,55 +53,56 @@ type ConfigClient struct {
 	cancel context.CancelFunc
 	nacos_client.INacosClient
 	configFilterChainManager filter.IConfigFilterChain
-	localConfigs             []vo.ConfigParam
 	mutex                    sync.Mutex
 	configProxy              IConfigProxy
 	configCacheDir           string
 	lastAllSyncTime          time.Time
-	cacheMap                 cache.ConcurrentMap
+	holder                   *configCacheHolder
 	uid                      string
 	listenExecute            chan struct{}
 	isClosed                 bool
 }
 
-type cacheData struct {
-	isInitializing    bool
-	dataId            string
-	group             string
-	content           string
-	contentType       string
-	encryptedDataKey  string
-	tenant            string
-	cacheDataListener *cacheDataListener
-	md5               string
-	appName           string
-	taskId            int
-	configClient      *ConfigClient
-	isSyncWithServer  bool
-}
+// notifyListenersIfChanged notifies every listener registered on cData whose
+// own md5 watermark differs from cData's current md5, and advances that
+// listener's watermark to the current md5. This is an interim, whole-entry
+// notify path kept behaviorally equivalent to the previous single-listener
+// executeListener(): Task 5 will replace it with real per-listener delivery
+// semantics.
+func (client *ConfigClient) notifyListenersIfChanged(cData *cacheData) {
+	cData.mu.Lock()
+	dataId, group, tenant := cData.dataId, cData.group, cData.tenant
+	content := cData.content
+	encryptedDataKey := cData.encryptedDataKey
+	md5 := cData.md5
+	toNotify := make([]*listenerWrap, 0, len(cData.listeners))
+	for _, lw := range cData.listeners {
+		if lw.lastCallMd5 != md5 {
+			lw.lastCallMd5 = md5
+			toNotify = append(toNotify, lw)
+		}
+	}
+	cData.mu.Unlock()
 
-type cacheDataListener struct {
-	listener vo.Listener
-	lastMd5  string
-}
-
-func (cacheData *cacheData) executeListener() {
-	cacheData.cacheDataListener.lastMd5 = cacheData.md5
-	cacheData.configClient.cacheMap.Set(util.GetConfigCacheKey(cacheData.dataId, cacheData.group, cacheData.tenant), *cacheData)
+	if len(toNotify) == 0 {
+		return
+	}
 
 	param := &vo.ConfigParam{
-		DataId:           cacheData.dataId,
-		Content:          cacheData.content,
-		EncryptedDataKey: cacheData.encryptedDataKey,
+		DataId:           dataId,
+		Content:          content,
+		EncryptedDataKey: encryptedDataKey,
 		UsageType:        vo.ResponseType,
 	}
-	if err := cacheData.configClient.configFilterChainManager.DoFilters(param); err != nil {
-		logger.Errorf("do filters failed ,dataId=%s,group=%s,tenant=%s,err:%+v ", cacheData.dataId,
-			cacheData.group, cacheData.tenant, err)
+	if err := client.configFilterChainManager.DoFilters(param); err != nil {
+		logger.Errorf("do filters failed ,dataId=%s,group=%s,tenant=%s,err:%+v ", dataId, group, tenant, err)
 		return
 	}
 	decryptedContent := param.Content
-	go cacheData.cacheDataListener.listener(cacheData.tenant, cacheData.group, cacheData.dataId, decryptedContent)
+	for _, lw := range toNotify {
+		listener := lw.listener
+		go listener(tenant, group, dataId, decryptedContent)
+	}
 }
 
 func NewConfigClientWithRamCredentialProvider(nc nacos_client.INacosClient, provider security.RamCredentialProvider) (*ConfigClient, error) {
@@ -155,7 +156,7 @@ func NewConfigClientWithRamCredentialProvider(nc nacos_client.INacosClient, prov
 	}
 
 	config.uid = uid.String()
-	config.cacheMap = cache.NewConcurrentMap()
+	config.holder = newConfigCacheHolder()
 	config.listenExecute = make(chan struct{})
 	config.startInternal()
 	return config, err
@@ -300,18 +301,30 @@ func (client *ConfigClient) DeleteConfig(param vo.ConfigParam) (deleted bool, er
 	return false, err
 }
 
-// Cancel Listen Config
+// CancelListenConfig cancels a previously registered listen for the given
+// key. If the key was never listened on, this is a no-op returning nil. The
+// entry (if any) is marked discarded rather than removed outright; reconciling
+// removal from the holder is left to removeIfDiscarded/the executor.
 func (client *ConfigClient) CancelListenConfig(param vo.ConfigParam) (err error) {
 	clientConfig, err := client.GetClientConfig()
 	if err != nil {
 		logger.Errorf("[checkConfigInfo.GetClientConfig] failed,err:%+v", err)
 		return
 	}
-	client.cacheMap.Remove(util.GetConfigCacheKey(param.DataId, param.Group, clientConfig.NamespaceId))
+	key := util.GetConfigCacheKey(param.DataId, param.Group, clientConfig.NamespaceId)
+	if cData, ok := client.holder.get(key); ok {
+		cData.markDiscard()
+		client.asyncNotifyListenConfig()
+	}
 	logger.Infof("Cancel listen config DataId:%s Group:%s", param.DataId, param.Group)
-	return err
+	return nil
 }
 
+// ListenConfig registers OnChange to be notified about changes to the
+// dataId/group/namespace identified by param. Calling it repeatedly for the
+// same key appends additional independent listeners rather than replacing
+// the previous one; calling it again after CancelListenConfig revives the
+// entry.
 func (client *ConfigClient) ListenConfig(param vo.ConfigParam) (err error) {
 	if len(param.DataId) <= 0 {
 		err = errors.New("[client.ListenConfig] DataId can not be empty")
@@ -328,43 +341,39 @@ func (client *ConfigClient) ListenConfig(param vo.ConfigParam) (err error) {
 	}
 
 	key := util.GetConfigCacheKey(param.DataId, param.Group, clientConfig.NamespaceId)
-	var cData cacheData
-	if v, ok := client.cacheMap.Get(key); ok {
-		cData = v.(cacheData)
-		cData.isInitializing = true
-	} else {
-		var (
-			content  string
-			md5Str   string
-			innerErr error
-		)
-		if content, innerErr = cache.ReadConfigFromFile(key, client.configCacheDir); innerErr != nil {
+	// Computed ahead of getOrCreate: getOrCreate already holds the holder's
+	// write lock while invoking seed, so calling back into holder.count()
+	// (which itself locks) from inside seed would deadlock.
+	taskId := client.holder.count() / perTaskConfigSize
+
+	cData := client.holder.getOrCreate(key, func() *cacheData {
+		content, innerErr := cache.ReadConfigFromFile(key, client.configCacheDir)
+		if innerErr != nil {
 			logger.Warn(innerErr)
 		}
 		encryptedDataKey, _ := cache.ReadEncryptedDataKeyFromFile(key, client.configCacheDir)
+		var md5Str string
 		if len(content) > 0 {
 			md5Str = util.Md5(content)
 		}
-		listener := &cacheDataListener{
-			listener: param.OnChange,
-			lastMd5:  md5Str,
+		return &cacheData{
+			isInitializing:   true,
+			dataId:           param.DataId,
+			group:            param.Group,
+			tenant:           clientConfig.NamespaceId,
+			content:          content,
+			md5:              md5Str,
+			encryptedDataKey: encryptedDataKey,
+			taskId:           taskId,
 		}
+	})
 
-		cData = cacheData{
-			isInitializing:    true,
-			dataId:            param.DataId,
-			group:             param.Group,
-			tenant:            clientConfig.NamespaceId,
-			content:           content,
-			md5:               md5Str,
-			cacheDataListener: listener,
-			encryptedDataKey:  encryptedDataKey,
-			taskId:            client.cacheMap.Count() / perTaskConfigSize,
-			configClient:      client,
-		}
-	}
-	client.cacheMap.Set(key, cData)
-	return
+	// Revive (discard=false) and append must happen in one critical section:
+	// see reviveAndAddListener's doc comment for why a separate lock/unlock
+	// around isInitializing/md5 followed by a separately-locked addListener
+	// call is unsafe against a concurrent CancelListenConfig.
+	cData.reviveAndAddListener(param.OnChange)
+	return nil
 }
 
 func (client *ConfigClient) SearchConfig(param vo.SearchConfigParam) (*model.ConfigPage, error) {
@@ -468,22 +477,23 @@ func (client *ConfigClient) executeConfigListen() {
 		for _, v := range response.ChangedConfigs {
 			changeKey := util.GetConfigCacheKey(v.DataId, v.Group, v.Tenant)
 			changeKeys[changeKey] = struct{}{}
-			if value, ok := client.cacheMap.Get(changeKey); ok {
-				cData := value.(cacheData)
-				client.refreshContentAndCheck(cData, !cData.isInitializing)
+			if cData, ok := client.holder.get(changeKey); ok {
+				cData.mu.Lock()
+				isInitializing := cData.isInitializing
+				cData.mu.Unlock()
+				client.refreshContentAndCheck(cData, !isInitializing)
 			}
 		}
 
-		for _, v := range client.cacheMap.Items() {
-			data := v.(cacheData)
-			changeKey := util.GetConfigCacheKey(data.dataId, data.group, data.tenant)
+		for _, cData := range client.holder.snapshot() {
+			cData.mu.Lock()
+			changeKey := util.GetConfigCacheKey(cData.dataId, cData.group, cData.tenant)
 			if _, ok := changeKeys[changeKey]; !ok {
-				data.isSyncWithServer = true
-				client.cacheMap.Set(changeKey, data)
-				continue
+				cData.isSyncWithServer = true
+			} else {
+				cData.isInitializing = true
 			}
-			data.isInitializing = true
-			client.cacheMap.Set(changeKey, data)
+			cData.mu.Unlock()
 		}
 
 	}
@@ -494,64 +504,67 @@ func (client *ConfigClient) executeConfigListen() {
 	if hasChangedKeys {
 		client.asyncNotifyListenConfig()
 	}
-	monitor.GetListenConfigCountMonitor().Set(float64(client.cacheMap.Count()))
+	monitor.GetListenConfigCountMonitor().Set(float64(client.holder.count()))
 }
 
-func buildConfigBatchListenRequest(caches []cacheData) *rpc_request.ConfigBatchListenRequest {
+func buildConfigBatchListenRequest(caches []*cacheData) *rpc_request.ConfigBatchListenRequest {
 	request := rpc_request.NewConfigBatchListenRequest(len(caches))
-	for _, cache := range caches {
-		request.ConfigListenContexts = append(request.ConfigListenContexts,
-			model.ConfigListenContext{Group: cache.group, Md5: cache.md5, DataId: cache.dataId, Tenant: cache.tenant})
+	for _, cData := range caches {
+		cData.mu.Lock()
+		ctx := model.ConfigListenContext{Group: cData.group, Md5: cData.md5, DataId: cData.dataId, Tenant: cData.tenant}
+		cData.mu.Unlock()
+		request.ConfigListenContexts = append(request.ConfigListenContexts, ctx)
 	}
 	return request
 }
 
-func (client *ConfigClient) refreshContentAndCheck(cacheData cacheData, notify bool) {
-	configQueryResponse, err := client.configProxy.queryConfig(cacheData.dataId, cacheData.group, cacheData.tenant,
+func (client *ConfigClient) refreshContentAndCheck(cData *cacheData, notify bool) {
+	cData.mu.Lock()
+	dataId, group, tenant := cData.dataId, cData.group, cData.tenant
+	cData.mu.Unlock()
+
+	configQueryResponse, err := client.configProxy.queryConfig(dataId, group, tenant,
 		constant.DEFAULT_TIMEOUT_MILLS, notify, client)
 	if err != nil {
-		logger.Errorf("refresh content and check md5 fail ,dataId=%s,group=%s,tenant=%s ", cacheData.dataId,
-			cacheData.group, cacheData.tenant)
+		logger.Errorf("refresh content and check md5 fail ,dataId=%s,group=%s,tenant=%s ", dataId, group, tenant)
 		return
 	}
 	if configQueryResponse != nil && configQueryResponse.Response != nil && !configQueryResponse.IsSuccess() {
 		logger.Errorf("refresh cached config from server error:%v, dataId=%s, group=%s", configQueryResponse.GetMessage(),
-			cacheData.dataId, cacheData.group)
+			dataId, group)
 		return
 	}
-	cacheData.content = configQueryResponse.Content
-	cacheData.contentType = configQueryResponse.ContentType
-	cacheData.encryptedDataKey = configQueryResponse.EncryptedDataKey
+
+	cData.mu.Lock()
+	cData.content = configQueryResponse.Content
+	cData.contentType = configQueryResponse.ContentType
+	cData.encryptedDataKey = configQueryResponse.EncryptedDataKey
 	if notify {
 		logger.Infof("[config_rpc_client] [data-received] dataId=%s, group=%s, tenant=%s, md5=%s, content=%s, type=%s",
-			cacheData.dataId, cacheData.group, cacheData.tenant, cacheData.md5,
-			util.TruncateContent(cacheData.content), cacheData.contentType)
+			dataId, group, tenant, cData.md5, util.TruncateContent(cData.content), cData.contentType)
 	}
-	cacheData.md5 = util.Md5(cacheData.content)
-	if cacheData.md5 != cacheData.cacheDataListener.lastMd5 {
-		cacheDataPtr := &cacheData
-		cacheDataPtr.executeListener()
-	}
+	cData.md5 = util.Md5(cData.content)
+	cData.mu.Unlock()
+
+	client.notifyListenersIfChanged(cData)
 }
 
-func (client *ConfigClient) buildListenTask(needAllSync bool) map[int][]cacheData {
-	listenTaskMap := make(map[int][]cacheData, 8)
+func (client *ConfigClient) buildListenTask(needAllSync bool) map[int][]*cacheData {
+	listenTaskMap := make(map[int][]*cacheData, 8)
 
-	for _, v := range client.cacheMap.Items() {
-		data, ok := v.(cacheData)
-		if !ok {
-			continue
-		}
+	for _, cData := range client.holder.snapshot() {
+		cData.mu.Lock()
+		isSyncWithServer := cData.isSyncWithServer
+		taskId := cData.taskId
+		cData.mu.Unlock()
 
-		if data.isSyncWithServer {
-			if data.md5 != data.cacheDataListener.lastMd5 {
-				data.executeListener()
-			}
+		if isSyncWithServer {
+			client.notifyListenersIfChanged(cData)
 			if !needAllSync {
 				continue
 			}
 		}
-		listenTaskMap[data.taskId] = append(listenTaskMap[data.taskId], data)
+		listenTaskMap[taskId] = append(listenTaskMap[taskId], cData)
 	}
 	return listenTaskMap
 }

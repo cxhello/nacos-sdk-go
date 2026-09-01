@@ -19,6 +19,9 @@ package config_client
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/security"
@@ -34,6 +37,7 @@ import (
 	"github.com/nacos-group/nacos-sdk-go/v3/common/http_agent"
 	"github.com/nacos-group/nacos-sdk-go/v3/vo"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 var serverConfigWithOptions = constant.NewServerConfig("127.0.0.1", 8848)
@@ -357,6 +361,144 @@ func TestCancelListenConfig(t *testing.T) {
 		err = client.CancelListenConfig(listenConfigParam)
 		assert.Nil(t, err)
 	})
+}
+
+// TestListenConfigAppendsSecondListener guards against the historical bug
+// where a second ListenConfig call on the same key silently replaced (and
+// therefore dropped) the first listener instead of appending to it.
+func TestListenConfigAppendsSecondListener(t *testing.T) {
+	client := createConfigClientTest()
+	got := make(chan string, 2)
+	for i := 0; i < 2; i++ {
+		idx := strconv.Itoa(i)
+		require.NoError(t, client.ListenConfig(vo.ConfigParam{DataId: "d", Group: "g",
+			OnChange: func(ns, g, d, data string) { got <- idx + ":" + data }}))
+	}
+	clientConfig, err := client.GetClientConfig()
+	require.NoError(t, err)
+	cd, ok := client.holder.get(util.GetConfigCacheKey("d", "g", clientConfig.NamespaceId))
+	require.True(t, ok)
+	assert.Len(t, cd.listeners, 2)
+}
+
+// TestCancelListenConfigMarksDiscard verifies CancelListenConfig does not
+// remove the cache entry outright (the executor/removeIfDiscarded reconcile
+// it later); it must simply mark it discarded.
+func TestCancelListenConfigMarksDiscard(t *testing.T) {
+	client := createConfigClientTest()
+	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: func(ns, g, d, data string) {}}
+	require.NoError(t, client.ListenConfig(p))
+	require.NoError(t, client.CancelListenConfig(p))
+
+	clientConfig, err := client.GetClientConfig()
+	require.NoError(t, err)
+	key := util.GetConfigCacheKey("d", "g", clientConfig.NamespaceId)
+	cd, ok := client.holder.get(key)
+	require.True(t, ok, "entry must still be present after cancel")
+	assert.True(t, cd.discard)
+}
+
+// TestCancelListenConfigOnUnknownKeyIsNoop verifies cancelling a key that was
+// never listened on is a no-op that returns nil, per the brief.
+func TestCancelListenConfigOnUnknownKeyIsNoop(t *testing.T) {
+	client := createConfigClientTest()
+	err := client.CancelListenConfig(vo.ConfigParam{DataId: "never-listened", Group: "g"})
+	assert.NoError(t, err)
+}
+
+// TestCancelThenListenRevives verifies that a Cancel followed by a Listen on
+// the same key revives the existing entry (discard flips back to false)
+// rather than leaking a second entry, and that the revived entry survives a
+// subsequent removeIfDiscarded sweep.
+func TestCancelThenListenRevives(t *testing.T) {
+	client := createConfigClientTest()
+	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: func(ns, g, d, data string) {}}
+	require.NoError(t, client.ListenConfig(p))
+	require.NoError(t, client.CancelListenConfig(p))
+	clientConfig, err := client.GetClientConfig()
+	require.NoError(t, err)
+	key := util.GetConfigCacheKey("d", "g", clientConfig.NamespaceId)
+	cd, _ := client.holder.get(key)
+	assert.True(t, cd.discard)
+	require.NoError(t, client.ListenConfig(p))
+	assert.False(t, cd.discard)
+	client.holder.removeIfDiscarded(key)
+	_, ok := client.holder.get(key)
+	assert.True(t, ok, "revived entry must survive removeIfDiscarded")
+}
+
+// TestListenCancelConcurrentNeverLeavesDiscardedWithListeners is a
+// regression test for a TOCTOU between getOrCreate's internal revive
+// (discard=false) and a subsequently, separately-locked addListener call in
+// ListenConfig: a concurrent CancelListenConfig (markDiscard) could
+// interleave between the two and leave the entry with discard==true and a
+// non-empty listeners slice. That combination must never be observable,
+// since Task 4's reap wiring treats discard==true as "safe to remove once
+// listeners is empty" and would otherwise build on an inconsistent
+// intermediate state. An observer goroutine samples the entry continuously
+// while two producer goroutines hammer ListenConfig/CancelListenConfig
+// concurrently, so a transient (not just a final) violation would be
+// caught.
+func TestListenCancelConcurrentNeverLeavesDiscardedWithListeners(t *testing.T) {
+	client := createConfigClientTest()
+	p := vo.ConfigParam{DataId: "race-d", Group: "race-g", OnChange: func(ns, g, d, data string) {}}
+
+	clientConfig, err := client.GetClientConfig()
+	require.NoError(t, err)
+	key := util.GetConfigCacheKey(p.DataId, p.Group, clientConfig.NamespaceId)
+
+	const iterations = 500
+
+	var producers sync.WaitGroup
+	producers.Add(2)
+	go func() {
+		defer producers.Done()
+		for i := 0; i < iterations; i++ {
+			_ = client.ListenConfig(p)
+		}
+	}()
+	go func() {
+		defer producers.Done()
+		for i := 0; i < iterations; i++ {
+			_ = client.CancelListenConfig(p)
+		}
+	}()
+
+	stop := make(chan struct{})
+	var violation atomic.Bool
+	var observer sync.WaitGroup
+	observer.Add(1)
+	go func() {
+		defer observer.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if cData, ok := client.holder.get(key); ok {
+				cData.mu.Lock()
+				if cData.discard && len(cData.listeners) > 0 {
+					violation.Store(true)
+				}
+				cData.mu.Unlock()
+			}
+		}
+	}()
+
+	producers.Wait()
+	close(stop)
+	observer.Wait()
+
+	assert.False(t, violation.Load(), "entry must never be observed with discard==true and non-empty listeners")
+
+	// Also assert the final resting state is consistent.
+	if cData, ok := client.holder.get(key); ok {
+		cData.mu.Lock()
+		finalInconsistent := cData.discard && len(cData.listeners) > 0
+		cData.mu.Unlock()
+		assert.False(t, finalInconsistent, "final state must not be discard==true with non-empty listeners")
+	}
 }
 
 type MockAccessKeyCredentialProvider struct {
