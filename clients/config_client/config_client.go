@@ -438,19 +438,55 @@ func (client *ConfigClient) startInternal() {
 	}()
 }
 
+// executeConfigListen runs one round of the listen executor. Each round:
+//  1. sends a Listen=false batch (grouped by taskId) for every discarded
+//     entry, and reaps each key via holder.removeIfDiscarded once its batch
+//     gets a successful response -- entries whose cancel batch errors or
+//     comes back non-success are left in place for the next round to retry;
+//  2. sends a Listen=true batch for every non-discarded entry that is either
+//     not in sync with the server or due for a full resync;
+//  3. for every key reported in ChangedConfigs, refreshes it via
+//     refreshContentAndCheck;
+//  4. marks every other entry in that listen batch as isSyncWithServer=true.
+//
+// Cancel batches are sent before listen batches each round so a key that is
+// simultaneously being cancelled and re-listened (a revive racing with an
+// in-flight cancel) is decided by removeIfDiscarded's own re-check rather
+// than by request ordering.
 func (client *ConfigClient) executeConfigListen() {
 	var (
 		needAllSync    = time.Since(client.lastAllSyncTime) >= constant.ALL_SYNC_INTERNAL
 		hasChangedKeys = false
 	)
 
-	listenTaskMap := client.buildListenTask(needAllSync)
-	if len(listenTaskMap) == 0 {
-		return
+	listenBatch, cancelBatch := client.buildListenTask(needAllSync)
+
+	for taskId, caches := range cancelBatch {
+		request := buildConfigBatchListenRequest(caches, false)
+		rpcClient := client.configProxy.createRpcClient(client.ctx, fmt.Sprintf("%d", taskId), client)
+		iResponse, err := client.configProxy.requestProxy(rpcClient, request, 3000)
+		if err != nil {
+			logger.Warnf("ConfigBatchListenRequest(cancel) failure, err:%v", err)
+			continue
+		}
+		if iResponse == nil {
+			logger.Warnf("ConfigBatchListenRequest(cancel) failure, response is nil")
+			continue
+		}
+		if !iResponse.IsSuccess() {
+			logger.Warnf("ConfigBatchListenRequest(cancel) failure, error code:%d", iResponse.GetErrorCode())
+			continue
+		}
+		for _, cData := range caches {
+			cData.mu.Lock()
+			key := util.GetConfigCacheKey(cData.dataId, cData.group, cData.tenant)
+			cData.mu.Unlock()
+			client.holder.removeIfDiscarded(key)
+		}
 	}
 
-	for taskId, caches := range listenTaskMap {
-		request := buildConfigBatchListenRequest(caches)
+	for taskId, caches := range listenBatch {
+		request := buildConfigBatchListenRequest(caches, true)
 		rpcClient := client.configProxy.createRpcClient(client.ctx, fmt.Sprintf("%d", taskId), client)
 		iResponse, err := client.configProxy.requestProxy(rpcClient, request, 3000)
 		if err != nil {
@@ -485,18 +521,18 @@ func (client *ConfigClient) executeConfigListen() {
 			}
 		}
 
-		for _, cData := range client.holder.snapshot() {
+		for _, cData := range caches {
 			cData.mu.Lock()
 			changeKey := util.GetConfigCacheKey(cData.dataId, cData.group, cData.tenant)
-			if _, ok := changeKeys[changeKey]; !ok {
+			if _, changed := changeKeys[changeKey]; !changed {
 				cData.isSyncWithServer = true
 			} else {
 				cData.isInitializing = true
 			}
 			cData.mu.Unlock()
 		}
-
 	}
+
 	if needAllSync {
 		client.lastAllSyncTime = time.Now()
 	}
@@ -507,8 +543,9 @@ func (client *ConfigClient) executeConfigListen() {
 	monitor.GetListenConfigCountMonitor().Set(float64(client.holder.count()))
 }
 
-func buildConfigBatchListenRequest(caches []*cacheData) *rpc_request.ConfigBatchListenRequest {
+func buildConfigBatchListenRequest(caches []*cacheData, listen bool) *rpc_request.ConfigBatchListenRequest {
 	request := rpc_request.NewConfigBatchListenRequest(len(caches))
+	request.Listen = listen
 	for _, cData := range caches {
 		cData.mu.Lock()
 		ctx := model.ConfigListenContext{Group: cData.group, Md5: cData.md5, DataId: cData.dataId, Tenant: cData.tenant}
@@ -549,24 +586,32 @@ func (client *ConfigClient) refreshContentAndCheck(cData *cacheData, notify bool
 	client.notifyListenersIfChanged(cData)
 }
 
-func (client *ConfigClient) buildListenTask(needAllSync bool) map[int][]*cacheData {
-	listenTaskMap := make(map[int][]*cacheData, 8)
+// buildListenTask partitions the current holder snapshot into two batches,
+// grouped by taskId: cancelBatch holds discarded entries (destined for a
+// Listen=false request), and listenBatch holds every other entry that is
+// either not in sync with the server or due for a full resync (destined for
+// a Listen=true request). An entry that is both in sync and not due for
+// resync needs no request this round and is omitted from both maps.
+func (client *ConfigClient) buildListenTask(needAllSync bool) (listenBatch, cancelBatch map[int][]*cacheData) {
+	listenBatch = make(map[int][]*cacheData, 8)
+	cancelBatch = make(map[int][]*cacheData, 8)
 
 	for _, cData := range client.holder.snapshot() {
 		cData.mu.Lock()
+		discard := cData.discard
 		isSyncWithServer := cData.isSyncWithServer
 		taskId := cData.taskId
 		cData.mu.Unlock()
 
-		if isSyncWithServer {
-			client.notifyListenersIfChanged(cData)
-			if !needAllSync {
-				continue
-			}
+		if discard {
+			cancelBatch[taskId] = append(cancelBatch[taskId], cData)
+			continue
 		}
-		listenTaskMap[taskId] = append(listenTaskMap[taskId], cData)
+		if !isSyncWithServer || needAllSync {
+			listenBatch[taskId] = append(listenBatch[taskId], cData)
+		}
 	}
-	return listenTaskMap
+	return listenBatch, cancelBatch
 }
 
 func (client *ConfigClient) asyncNotifyListenConfig() {

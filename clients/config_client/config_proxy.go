@@ -218,15 +218,18 @@ func (c *ConfigChangeNotifyRequestHandler) RequestReply(request rpc_request.IReq
 
 	cacheKey := util.GetConfigCacheKey(configChangeNotifyRequest.DataId, configChangeNotifyRequest.Group,
 		configChangeNotifyRequest.Tenant)
+	successResponse := &rpc_response.NotifySubscriberResponse{
+		Response: &rpc_response.Response{ResultCode: constant.RESPONSE_CODE_SUCCESS, Success: true},
+	}
 	cData, ok := c.client.holder.get(cacheKey)
 	if !ok {
-		return nil
+		// Nothing locally listens on this key (any more): still ack the push
+		// so the server doesn't treat it as a delivery failure and retry.
+		return successResponse
 	}
 	cData.mu.Lock()
 	cData.isSyncWithServer = false
 	cData.mu.Unlock()
 	c.client.asyncNotifyListenConfig()
-	return &rpc_response.NotifySubscriberResponse{
-		Response: &rpc_response.Response{ResultCode: constant.RESPONSE_CODE_SUCCESS},
-	}
+	return successResponse
 }

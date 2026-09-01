@@ -19,14 +19,17 @@ package config_client
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/nacos-group/nacos-sdk-go/v3/common/security"
 	"github.com/nacos-group/nacos-sdk-go/v3/util"
 
+	"github.com/nacos-group/nacos-sdk-go/v3/common/filter"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_request"
 	"github.com/nacos-group/nacos-sdk-go/v3/common/remote/rpc/rpc_response"
@@ -383,9 +386,13 @@ func TestListenConfigAppendsSecondListener(t *testing.T) {
 
 // TestCancelListenConfigMarksDiscard verifies CancelListenConfig does not
 // remove the cache entry outright (the executor/removeIfDiscarded reconcile
-// it later); it must simply mark it discarded.
+// it later); it must simply mark it discarded. Uses newExecutorTestClient
+// (no background executeConfigListen loop) since, now that the executor
+// really does reap discarded entries via removeIfDiscarded, a client with a
+// live loop could race the assertion below and remove the entry before it
+// runs.
 func TestCancelListenConfigMarksDiscard(t *testing.T) {
-	client := createConfigClientTest()
+	client := newExecutorTestClient(&MockConfigProxy{})
 	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: func(ns, g, d, data string) {}}
 	require.NoError(t, client.ListenConfig(p))
 	require.NoError(t, client.CancelListenConfig(p))
@@ -409,9 +416,10 @@ func TestCancelListenConfigOnUnknownKeyIsNoop(t *testing.T) {
 // TestCancelThenListenRevives verifies that a Cancel followed by a Listen on
 // the same key revives the existing entry (discard flips back to false)
 // rather than leaking a second entry, and that the revived entry survives a
-// subsequent removeIfDiscarded sweep.
+// subsequent removeIfDiscarded sweep. Uses newExecutorTestClient for the same
+// race-avoidance reason as TestCancelListenConfigMarksDiscard above.
 func TestCancelThenListenRevives(t *testing.T) {
-	client := createConfigClientTest()
+	client := newExecutorTestClient(&MockConfigProxy{})
 	p := vo.ConfigParam{DataId: "d", Group: "g", OnChange: func(ns, g, d, data string) {}}
 	require.NoError(t, client.ListenConfig(p))
 	require.NoError(t, client.CancelListenConfig(p))
@@ -551,4 +559,310 @@ func Test_ConfigClientWithProvider(t *testing.T) {
 
 	assert.Nil(t, err)
 	assert.Equal(t, "hello world", content)
+}
+
+// ---------------------------------------------------------------------------
+// executeConfigListen dual-batch executor tests (#629).
+//
+// scriptedProxy is a programmable IConfigProxy fake: it records every
+// ConfigBatchListenRequest it sees and replies via the scripted reply func.
+// It embeds the (nil) IConfigProxy interface so that any method the tests
+// don't need and don't override panics on a nil-interface dispatch -- an
+// unexpected call fails the test loudly instead of silently succeeding.
+// ---------------------------------------------------------------------------
+
+type scriptedProxy struct {
+	IConfigProxy // embedded, intentionally nil: unoverridden methods panic if called
+
+	mu   sync.Mutex
+	sent []*rpc_request.ConfigBatchListenRequest
+
+	reply         func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error)
+	queryConfigFn func(dataId, group, tenant string, timeout uint64, notify bool, client *ConfigClient) (*rpc_response.ConfigQueryResponse, error)
+}
+
+func (p *scriptedProxy) requestProxy(rpcClient *rpc.RpcClient, req rpc_request.IRequest, timeout uint64) (rpc_response.IResponse, error) {
+	if blr, ok := req.(*rpc_request.ConfigBatchListenRequest); ok {
+		p.mu.Lock()
+		p.sent = append(p.sent, blr)
+		p.mu.Unlock()
+		return p.reply(blr)
+	}
+	return nil, errors.New("unexpected request in test")
+}
+
+func (p *scriptedProxy) createRpcClient(ctx context.Context, taskId string, c *ConfigClient) *rpc.RpcClient {
+	return nil
+}
+
+func (p *scriptedProxy) getRpcClient(c *ConfigClient) *rpc.RpcClient {
+	return nil
+}
+
+// queryConfig is only wired up for tests that exercise the changed-key
+// refresh path; other tests never trigger it, and calling it without
+// queryConfigFn set (a nil func) panics, preserving the "unexpected call
+// fails the test" property.
+func (p *scriptedProxy) queryConfig(dataId, group, tenant string, timeout uint64, notify bool, client *ConfigClient) (*rpc_response.ConfigQueryResponse, error) {
+	return p.queryConfigFn(dataId, group, tenant, timeout, notify, client)
+}
+
+func (p *scriptedProxy) sentSnapshot() []*rpc_request.ConfigBatchListenRequest {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	out := make([]*rpc_request.ConfigBatchListenRequest, len(p.sent))
+	copy(out, p.sent)
+	return out
+}
+
+func batchListenSuccess(changed ...model.ConfigContext) *rpc_response.ConfigChangeBatchListenResponse {
+	return &rpc_response.ConfigChangeBatchListenResponse{
+		Response:       &rpc_response.Response{Success: true},
+		ChangedConfigs: changed,
+	}
+}
+
+// newExecutorTestClient builds a ConfigClient wired to proxy without starting
+// the background executeConfigListen loop (startInternal is never called), so
+// tests can drive client.executeConfigListen() directly and deterministically
+// -- no concurrent background round can interleave with the call under test.
+func newExecutorTestClient(proxy IConfigProxy) *ConfigClient {
+	nc := nacos_client.NacosClient{}
+	_ = nc.SetServerConfig([]constant.ServerConfig{*serverConfigWithOptions})
+	_ = nc.SetClientConfig(*clientConfigWithOptions)
+	_ = nc.SetHttpAgent(&http_agent.HttpAgent{})
+
+	client := &ConfigClient{}
+	client.ctx, client.cancel = context.WithCancel(context.Background())
+	client.INacosClient = &nc
+	client.configFilterChainManager = filter.NewConfigFilterChainManager()
+	client.configProxy = proxy
+	client.holder = newConfigCacheHolder()
+	client.listenExecute = make(chan struct{})
+	return client
+}
+
+func testConfigKey(t *testing.T, client *ConfigClient, dataId, group string) string {
+	t.Helper()
+	clientConfig, err := client.GetClientConfig()
+	require.NoError(t, err)
+	return util.GetConfigCacheKey(dataId, group, clientConfig.NamespaceId)
+}
+
+func noopOnChange(string, string, string, string) {}
+
+// TestExecuteConfigListen_CancelSendsListenFalseBatch is the canonical RED
+// test for #629: cancelling the only listened key must make the executor
+// send a Listen=false batch naming that key. The pre-fix single-batch
+// executor never distinguishes discarded entries from active ones, so it
+// either omits the request or sends it with Listen=true, never notifying the
+// server that the key should stop being pushed.
+func TestExecuteConfigListen_CancelSendsListenFalseBatch(t *testing.T) {
+	p := &scriptedProxy{
+		reply: func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+			return batchListenSuccess(), nil
+		},
+	}
+	client := newExecutorTestClient(p)
+
+	param := vo.ConfigParam{DataId: "d1", Group: "g1", OnChange: noopOnChange}
+	require.NoError(t, client.ListenConfig(param))
+	require.NoError(t, client.CancelListenConfig(param))
+
+	client.executeConfigListen()
+
+	sent := p.sentSnapshot()
+	require.Len(t, sent, 1, "cancelling the only listened key must produce exactly one batch request")
+	assert.False(t, sent[0].Listen, "cancel batch must be sent with Listen=false")
+
+	key := testConfigKey(t, client, "d1", "g1")
+	found := false
+	for _, ctx := range sent[0].ConfigListenContexts {
+		if util.GetConfigCacheKey(ctx.DataId, ctx.Group, ctx.Tenant) == key {
+			found = true
+		}
+	}
+	assert.True(t, found, "cancel batch must include the cancelled key")
+}
+
+// TestExecuteConfigListen_CancelBatchReconciliation covers reconciliation
+// after the Listen=false batch response: success reaps the entry via
+// removeIfDiscarded, while a transport error or a non-success response must
+// leave the entry in place so it is retried on the next round.
+func TestExecuteConfigListen_CancelBatchReconciliation(t *testing.T) {
+	t.Run("success reaps entry", func(t *testing.T) {
+		p := &scriptedProxy{
+			reply: func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+				return batchListenSuccess(), nil
+			},
+		}
+		client := newExecutorTestClient(p)
+		param := vo.ConfigParam{DataId: "d2", Group: "g2", OnChange: noopOnChange}
+		require.NoError(t, client.ListenConfig(param))
+		require.NoError(t, client.CancelListenConfig(param))
+
+		client.executeConfigListen()
+
+		key := testConfigKey(t, client, "d2", "g2")
+		_, ok := client.holder.get(key)
+		assert.False(t, ok, "entry must be reaped after a successful cancel batch")
+	})
+
+	t.Run("transport error keeps entry for retry", func(t *testing.T) {
+		p := &scriptedProxy{
+			reply: func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+				return nil, errors.New("boom")
+			},
+		}
+		client := newExecutorTestClient(p)
+		param := vo.ConfigParam{DataId: "d3", Group: "g3", OnChange: noopOnChange}
+		require.NoError(t, client.ListenConfig(param))
+		require.NoError(t, client.CancelListenConfig(param))
+
+		client.executeConfigListen()
+
+		key := testConfigKey(t, client, "d3", "g3")
+		cd, ok := client.holder.get(key)
+		require.True(t, ok, "entry must be kept for retry when the cancel batch errors")
+		cd.mu.Lock()
+		defer cd.mu.Unlock()
+		assert.True(t, cd.discard)
+	})
+
+	t.Run("non-success response keeps entry for retry", func(t *testing.T) {
+		p := &scriptedProxy{
+			reply: func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+				return &rpc_response.ConfigChangeBatchListenResponse{Response: &rpc_response.Response{Success: false}}, nil
+			},
+		}
+		client := newExecutorTestClient(p)
+		param := vo.ConfigParam{DataId: "d3b", Group: "g3b", OnChange: noopOnChange}
+		require.NoError(t, client.ListenConfig(param))
+		require.NoError(t, client.CancelListenConfig(param))
+
+		client.executeConfigListen()
+
+		key := testConfigKey(t, client, "d3b", "g3b")
+		_, ok := client.holder.get(key)
+		require.True(t, ok, "entry must be kept for retry when the cancel batch response is not success")
+	})
+}
+
+// TestExecuteConfigListen_CancelAndListenBatchesDoNotCrossContaminate checks
+// that when both a discarded key and an active key are pending, the executor
+// sends two independent batches (cancel first, then listen), each carrying
+// only the keys it owns.
+func TestExecuteConfigListen_CancelAndListenBatchesDoNotCrossContaminate(t *testing.T) {
+	p := &scriptedProxy{
+		reply: func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+			return batchListenSuccess(), nil
+		},
+	}
+	client := newExecutorTestClient(p)
+
+	cancelParam := vo.ConfigParam{DataId: "cd", Group: "cg", OnChange: noopOnChange}
+	listenParam := vo.ConfigParam{DataId: "ld", Group: "lg", OnChange: noopOnChange}
+	require.NoError(t, client.ListenConfig(cancelParam))
+	require.NoError(t, client.ListenConfig(listenParam))
+	require.NoError(t, client.CancelListenConfig(cancelParam))
+
+	client.executeConfigListen()
+
+	sent := p.sentSnapshot()
+	require.Len(t, sent, 2, "both a cancel batch and a listen batch must be sent")
+	assert.False(t, sent[0].Listen, "the cancel batch must be sent before the listen batch")
+	assert.True(t, sent[1].Listen, "the listen batch must be sent after the cancel batch")
+
+	cancelKey := testConfigKey(t, client, "cd", "cg")
+	listenKey := testConfigKey(t, client, "ld", "lg")
+
+	containsKey := func(req *rpc_request.ConfigBatchListenRequest, key string) bool {
+		for _, ctx := range req.ConfigListenContexts {
+			if util.GetConfigCacheKey(ctx.DataId, ctx.Group, ctx.Tenant) == key {
+				return true
+			}
+		}
+		return false
+	}
+
+	assert.True(t, containsKey(sent[0], cancelKey), "cancel batch must contain the cancelled key")
+	assert.False(t, containsKey(sent[0], listenKey), "cancel batch must not contain the active key")
+	assert.True(t, containsKey(sent[1], listenKey), "listen batch must contain the active key")
+	assert.False(t, containsKey(sent[1], cancelKey), "listen batch must not contain the cancelled key")
+}
+
+// TestExecuteConfigListen_ChangedKeyNotifiesAllListeners verifies that a key
+// reported in ChangedConfigs is refreshed via refreshContentAndCheck and that
+// every listener registered on that key is notified. Per controller ruling
+// R1, this is asserted against the current interim delivery path's
+// observable behavior (both listeners receive the change), not against
+// Task 5's future per-listener watermark implementation.
+func TestExecuteConfigListen_ChangedKeyNotifiesAllListeners(t *testing.T) {
+	got := make(chan string, 2)
+	p := &scriptedProxy{}
+	p.reply = func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+		return batchListenSuccess(model.ConfigContext{DataId: "d4", Group: "g4"}), nil
+	}
+	p.queryConfigFn = func(dataId, group, tenant string, timeout uint64, notify bool, client *ConfigClient) (*rpc_response.ConfigQueryResponse, error) {
+		return &rpc_response.ConfigQueryResponse{
+			Response: &rpc_response.Response{Success: true},
+			Content:  "new-content",
+		}, nil
+	}
+	client := newExecutorTestClient(p)
+
+	for i := 0; i < 2; i++ {
+		idx := i
+		require.NoError(t, client.ListenConfig(vo.ConfigParam{
+			DataId: "d4", Group: "g4",
+			OnChange: func(ns, g, d, data string) { got <- fmt.Sprintf("%d:%s", idx, data) },
+		}))
+	}
+
+	client.executeConfigListen()
+
+	received := map[string]bool{}
+	deadline := time.After(2 * time.Second)
+	for i := 0; i < 2; i++ {
+		select {
+		case v := <-got:
+			received[v] = true
+		case <-deadline:
+			t.Fatalf("timed out waiting for listener notifications, got so far: %v", received)
+		}
+	}
+	assert.True(t, received["0:new-content"], "listener 0 must be notified of the change")
+	assert.True(t, received["1:new-content"], "listener 1 must be notified of the change")
+}
+
+// TestExecuteConfigListen_ReviveDuringCancelSendPreventsRemoval simulates a
+// ListenConfig racing in while the Listen=false cancel batch for the same key
+// is in flight: by the time the response comes back the entry has already
+// been revived, so removeIfDiscarded must refuse to delete it.
+func TestExecuteConfigListen_ReviveDuringCancelSendPreventsRemoval(t *testing.T) {
+	var client *ConfigClient
+	param := vo.ConfigParam{DataId: "d5", Group: "g5", OnChange: noopOnChange}
+
+	p := &scriptedProxy{}
+	p.reply = func(req *rpc_request.ConfigBatchListenRequest) (rpc_response.IResponse, error) {
+		if !req.Listen {
+			// Simulate a concurrent ListenConfig reviving the entry while
+			// the cancel batch is still in flight.
+			require.NoError(t, client.ListenConfig(param))
+		}
+		return batchListenSuccess(), nil
+	}
+	client = newExecutorTestClient(p)
+
+	require.NoError(t, client.ListenConfig(param))
+	require.NoError(t, client.CancelListenConfig(param))
+
+	client.executeConfigListen()
+
+	key := testConfigKey(t, client, "d5", "g5")
+	cd, ok := client.holder.get(key)
+	require.True(t, ok, "revived entry must not be removed by the in-flight cancel batch")
+	cd.mu.Lock()
+	defer cd.mu.Unlock()
+	assert.False(t, cd.discard, "revived entry must not be discarded")
 }
